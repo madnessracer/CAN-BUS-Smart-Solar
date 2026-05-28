@@ -25,7 +25,13 @@ Ladespannungen (Absorption / Float) können zusätzlich per VE.Direct HEX-Protok
 | CAN SE (Transceiver Enable) | 23 |
 | VE.Direct RX (Serial2) | 25 |
 | VE.Direct TX (Serial2) | 18 |
+| DHT22 DATA | 32 |
+| DS18B20 DQ | 33 |
 | WS2812 LED | 4 |
+
+Sensor-Hinweis:
+- DHT22 und DS18B20 jeweils mit Pullup 4.7k nach 3.3V am Datenpin.
+- GPIO34/35 sind input-only und fuer diese Sensoren ungeeignet.
 
 ---
 
@@ -52,6 +58,13 @@ Alle Pakete werden bei jedem vollständigen VE.Direct TEXT-Frame gesendet (~1×/
 |---|---|---|---|---|
 | `MessageBasisID` | 0x4E2 | 0x500 | 6 | Byte 0-1: Batteriespannung [mV] · Byte 2-3: Ladestrom [0,1A] · Byte 4-5: Panel-Leistung [W] |
 | `MessageBasisID1` | 0x4E3 | 0x501 | 6 | Byte 0-1: Panel-Spannung [mV] · Byte 2-3: Panel-Strom (PPV/VPV, berechnet) [0,1A] · Byte 4-5: Tageszähler HSDS |
+| `MessageSensorID` | 0x4E6 | 0x504 | 3 | Byte 0: DS18B20 Temp (T+50) · Byte 1: DHT22 Temp (T+50) · Byte 2: DHT22 Feuchte [%] |
+
+Sensor-Byte-Codierung:
+- Bytewert 0xFF bedeutet ungueltig oder Sensor nicht vorhanden.
+- DS18B20: T[degC] = Byte0 - 50
+- DHT22 Temp: T[degC] = Byte1 - 50
+- DHT22 Feuchte: RH[%] = Byte2
 
 ### Heartbeat
 
@@ -72,18 +85,51 @@ Eingehend auf `Can_Solar_Cmd`, Antwort auf `Can_Solar_Resp`:
 
 | Byte 0 | Byte 1-2 | Funktion |
 |---|---|---|
+| 0x7E | 0xA5 0x5A | Schreibzugriff für 60 s freigeben |
 | 0x10 | – | Absorption-Spannung lesen |
 | 0x11 | Spannung × 100, uint16 BE | Absorption-Spannung setzen |
 | 0x12 | – | Float-Spannung lesen |
 | 0x13 | Spannung × 100, uint16 BE | Float-Spannung setzen |
+| 0x14 | – | Regler einschalten |
+| 0x15 | – | Regler ausschalten |
 
 **Antwortformat (Can_Solar_Resp):**
 
 | Byte 0 | Byte 1 | Byte 2-3 |
 |---|---|---|
-| Cmd-Echo | 0x00 = OK / 0x01 = Fehler | Spannung × 100, uint16 BE (nur bei Lese-Antwort) |
+| Cmd-Echo | 0x00 = OK / 0x01 = Fehler / 0x02 = gesperrt / 0x03 = ungültiger Wert | Spannung × 100, uint16 BE (nur bei Lese-Antwort) |
 
 Beispiel: Float auf 27,2 V setzen → `0x13 0x0A 0xA0` (2720 = 0x0AA0)
+
+### Testframes (Ablauf)
+
+1. Schreiben freigeben: `7E A5 5A`
+2. Absorption setzen (z.B. 28,8 V): `11 0B 40`
+3. Float setzen (z.B. 27,2 V): `13 0A A0`
+4. Regler einschalten: `14`
+5. Regler ausschalten: `15`
+6. Absorption lesen: `10`
+7. Float lesen: `12`
+
+CAN-IDs für den Ablauf:
+
+| Busseite | Cmd-ID | Resp-ID |
+|---|---|---|
+| solar_links | 0x4E4 | 0x4E5 |
+| solar_rechts | 0x502 | 0x503 |
+
+Typische Antworten:
+
+| Antwort | Bedeutung |
+|---|---|
+| `11 00` | Absorption setzen erfolgreich |
+| `13 00` | Float setzen erfolgreich |
+| `14 00` | Regler eingeschaltet |
+| `15 00` | Regler ausgeschaltet |
+| `11 02` oder `13 02` | Schreiben nicht freigegeben |
+| `14 02` oder `15 02` | Schalten nicht freigegeben |
+| `10 00 0B 40` | Absorption gelesen = 28,8 V |
+| `12 00 0A A0` | Float gelesen = 27,2 V |
 
 > **Hinweis:** Beim Setzen von Ladespannungen wird intern automatisch der Battery-Typ auf „User defined" (Register 0xEDF1 = 0xFF) gesetzt, sonst quittiert der Regler mit Error 119.
 
@@ -118,6 +164,8 @@ Wichtige Befehle:
 | `current <A>` | Max. Ladestrom setzen |
 | `yield` | Ertrag heute und gestern |
 | `status` | Regler-Status |
+| `sensor` | Letzte DHT22/DS18B20-Messwerte anzeigen |
+| `sensor update` | Sensorwerte sofort neu einlesen |
 
 ---
 

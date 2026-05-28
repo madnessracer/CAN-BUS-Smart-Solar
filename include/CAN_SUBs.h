@@ -4,6 +4,9 @@
 #include <cstdarg>
 #include "driver/twai.h"
 
+// Forward-Deklaration aus FileSystem.h
+void ErrorLogAdd(String message);
+
 // TWAI-Nachrichten-Strukturen
 twai_message_t rx_frame; // NUR zum Empfangen
 twai_message_t tx;       // NUR zum Senden
@@ -41,12 +44,15 @@ bool CAN_Init(gpio_num_t txPin, gpio_num_t rxPin, uint8_t rxQueueLen)
 // Prüft CAN-Bus-Alerts und führt bei Bus-Off einen Neustart des TWAI-Treibers durch
 // Bei wiederholtem Fehlschlag: kontrollierter ESP-Neustart
 static uint8_t canRecoveryFailCount = 0;
+static bool s_canErrorReported = false;        // Fehlermeldung nur einmal ausgeben
+static unsigned long s_lastBusOffLogMs = 0;    // Rate-Limiter: Bus-Off max 1x/60s loggen
+#define CAN_BUSOFF_LOG_INTERVAL_MS 60000
 
 // Mindestabstand zwischen CAN-Paketen damit andere Teilnehmer senden können
 #define CAN_INTER_MSG_DELAY_MS 10
 static unsigned long _lastCanSendMs = 0;
 static uint8_t _canTxErrCount = 0;   // Zählt aufeinanderfolgende TX-Fehler
-#define CAN_TX_ERR_MAX 10             // Nach N Fehlern: TWAI-Neustart
+#define CAN_TX_ERR_MAX 50             // Nach N Fehlern: TWAI-Neustart
 
 inline void CAN_InterMsgDelay()
 {
@@ -68,10 +74,15 @@ void CAN_CheckAndRecoverBusOff()
   {
     if (alerts & TWAI_ALERT_BUS_OFF)
     {
-      Serial.println("[CAN] Bus-Off erkannt – Neustart des TWAI-Treibers");
+      bool shouldLog = (millis() - s_lastBusOffLogMs >= CAN_BUSOFF_LOG_INTERVAL_MS);
+      if (shouldLog)
+      {
+        s_lastBusOffLogMs = millis();
+        ErrorLogAdd("[CAN] Bus-Off erkannt");
+      }
       twai_stop();
       twai_driver_uninstall();
-      delay(100);
+      delay(200);
       twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_NORMAL);
       g_config.rx_queue_len = 50;
       twai_timing_config_t t_config = TWAI_TIMING_CONFIG_250KBITS();
@@ -80,44 +91,29 @@ void CAN_CheckAndRecoverBusOff()
       {
         uint32_t alertsToEnable = TWAI_ALERT_BUS_OFF | TWAI_ALERT_BUS_RECOVERED | TWAI_ALERT_ERR_PASS | TWAI_ALERT_ABOVE_ERR_WARN;
         twai_reconfigure_alerts(alertsToEnable, NULL);
-        Serial.println("[CAN] TWAI-Treiber erfolgreich neu gestartet");
         canRecoveryFailCount = 0;
+        _canTxErrCount = 0;
+        s_canErrorReported = false;
       }
       else
       {
         canRecoveryFailCount++;
-        Serial.printf("[CAN] TWAI-Neustart fehlgeschlagen! (Versuch %u)\n", canRecoveryFailCount);
         if (canRecoveryFailCount >= 3)
         {
-          Serial.println("[CAN] Zu viele Fehler – ESP wird neu gestartet");
           delay(500);
           esp_restart();
         }
       }
     }
-    if (alerts & TWAI_ALERT_ERR_PASS)       Serial.println("[CAN] Error-Passive");
-    if (alerts & TWAI_ALERT_ABOVE_ERR_WARN) Serial.println("[CAN] Fehlerwarnung überschritten");
-    if (alerts & TWAI_ALERT_BUS_RECOVERED)  { Serial.println("[CAN] Bus wiederhergestellt"); _canTxErrCount = 0; }
+    if (alerts & TWAI_ALERT_ERR_PASS)       { if (!s_canErrorReported && (millis() - s_lastBusOffLogMs >= CAN_BUSOFF_LOG_INTERVAL_MS)) { s_lastBusOffLogMs = millis(); ErrorLogAdd("[CAN] Error-Passive – kein CAN-Bus angeschlossen?"); s_canErrorReported = true; } }
+    if (alerts & TWAI_ALERT_ABOVE_ERR_WARN) { if (!s_canErrorReported && (millis() - s_lastBusOffLogMs >= CAN_BUSOFF_LOG_INTERVAL_MS)) { s_canErrorReported = true; } }
+    if (alerts & TWAI_ALERT_BUS_RECOVERED)  { _canTxErrCount = 0; s_canErrorReported = false; s_lastBusOffLogMs = 0; }
   }
 
-  // Error-Passive Recovery: nach N aufeinanderfolgenden TX-Fehlern TWAI neu starten
+  // TX-Fehlerzähler: nur loggen, kein aggressiver TWAI-Neustart (Bus-Off-Alert übernimmt das)
   if (_canTxErrCount >= CAN_TX_ERR_MAX)
   {
-    Serial.printf("[CAN] %u TX-Fehler in Folge \u2013 TWAI wird neu gestartet\n", _canTxErrCount);
     _canTxErrCount = 0;
-    twai_stop();
-    twai_driver_uninstall();
-    delay(200);
-    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_NORMAL);
-    g_config.rx_queue_len = 50;
-    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_250KBITS();
-    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-    if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK && twai_start() == ESP_OK)
-    {
-      uint32_t alertsToEnable = TWAI_ALERT_BUS_OFF | TWAI_ALERT_BUS_RECOVERED | TWAI_ALERT_ERR_PASS | TWAI_ALERT_ABOVE_ERR_WARN;
-      twai_reconfigure_alerts(alertsToEnable, NULL);
-      Serial.println("[CAN] TWAI nach Error-Passive neu gestartet");
-    }
   }
 }
 
@@ -136,7 +132,7 @@ void CAN_Send(uint MesageID, byte MesageByte1 = 0, byte MesageByte2 = 0, byte Me
   tx.data[7] = MesageByte8;
 
   esp_err_t ret = twai_transmit(&tx, pdMS_TO_TICKS(50));
-  if (ret != ESP_OK) { Serial.printf("[CAN] CAN_Send TX Fehler 0x%X\n", ret); _canTxErrCount++; }
+  if (ret != ESP_OK) { if (!s_canErrorReported) { Serial.printf("[CAN] CAN_Send TX Fehler 0x%X\n", ret); s_canErrorReported = true; } _canTxErrCount++; }
   else { _canTxErrCount = 0; }
   CAN_InterMsgDelay();
 }
@@ -160,7 +156,7 @@ void CAN_SendEx(bool frameExtended, uint8_t dlc, uint MesageID, ...)
 
   for (uint8_t i = dlc; i < 8; ++i) tx.data[i] = 0;
   esp_err_t ret = twai_transmit(&tx, pdMS_TO_TICKS(50));
-  if (ret != ESP_OK) { Serial.printf("[CAN] CAN_SendEx TX Fehler 0x%X\n", ret); _canTxErrCount++; }
+  if (ret != ESP_OK) { if (!s_canErrorReported) { Serial.printf("[CAN] CAN_SendEx TX Fehler 0x%X\n", ret); s_canErrorReported = true; } _canTxErrCount++; }
   else { _canTxErrCount = 0; }
   CAN_InterMsgDelay();
 }

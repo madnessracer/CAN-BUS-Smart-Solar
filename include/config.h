@@ -1,6 +1,8 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+#include <FastLED.h>
+
 // PIN
 #define PIN_5V_EN 16
 
@@ -20,10 +22,13 @@
 
 #define LED_PIN 4
 #define NUM_LEDS 1
-CRGB leds[NUM_LEDS];
+extern CRGB leds[NUM_LEDS];
 
-#define RX_PIN 25      // UART RX
-#define TX_PIN 18     // UART TX (deaktiviert)
+#define RX_PIN 25 // UART RX
+#define TX_PIN 18 // UART TX
+
+#define DHT22_PIN 32
+#define DS18B20_PIN 33
 
 #define BAUD_RATE 19200
 

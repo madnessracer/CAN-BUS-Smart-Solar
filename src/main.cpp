@@ -18,9 +18,13 @@
 #include <Wlan_Config.h>
 #include <CAN_INPUT_OTA.h>
 #include <VE_HEX.h>
+#include <SystemTests.h>
+#include <CanCommandHandler.h>
+#include <SensorManager.h>
 #include <debug_menu.h>
 
 // Globale Variablen für LED-Blinken
+CRGB leds[NUM_LEDS];
 unsigned long ledBlinkStart = 0;
 bool ledBlinking = false;
 
@@ -41,17 +45,25 @@ const unsigned long SOLAR_TIMEOUT_MS = 30000; // 30s ohne Daten → Serial2 rese
 unsigned long lastWifiRetryTime = 0;
 const unsigned long WIFI_RETRY_INTERVAL_MS = 60000; // 60s
 
+// CAN-Schutz: Setzbefehle nur in zeitlich begrenztem Freigabe-Fenster erlauben
+bool canWriteUnlocked = false;
+unsigned long canWriteUnlockUntil = 0;
+const unsigned long CAN_WRITE_UNLOCK_WINDOW_MS = 60000; // 60s
+const uint8_t CAN_WRITE_UNLOCK_KEY1 = 0xA5;
+const uint8_t CAN_WRITE_UNLOCK_KEY2 = 0x5A;
+
 void setup()
 {
 
   Serial.begin(115200);
-
+  Serial.write(0x00);
   Serial.println("------------------------------------------------");
   Serial.println();
-  Serial.println("Bootvorgang gestartet...");
+  Serial.println("Bootvorgang gestartet... " + String(WIFI_Name));
 
   incrementBootCount();
   Serial.printf("Firmware-Version: %lu, Boot-Zähler: %lu\n", getFirmwareVersion(), getBootCount());
+  ErrorLogInit();
 
   FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(13);
@@ -59,9 +71,12 @@ void setup()
   FastLED.show();
 
   Serial2.begin(BAUD_RATE, SERIAL_8N1, RX_PIN, TX_PIN);
+  Sensors_Init();
 
   pinMode(CAN_SE_PIN, OUTPUT);
   digitalWrite(CAN_SE_PIN, LOW);
+  pinMode(PIN_5V_EN, OUTPUT);
+  digitalWrite(PIN_5V_EN, HIGH);
   delay(100); // Kurze Verzögerung, um sicherzustellen, dass der Transceiver bereit ist
   Serial.println("CAN SE (GPIO23) als OUTPUT gesetzt (Can Transceiver aktiv)");
 
@@ -77,18 +92,24 @@ void setup()
 
   // Serial.print("CAN SPEED :");
   // Serial.println(CAN_cfg.speed);
+  delay(500); // Kurz warten damit andere CAN-Teilnehmer bereit sind
   CAN_SendEx(true, 1, IP_Send_to_CAN, 0x03);
 
   esp_task_wdt_init(WDT_TIMEOUT_SEC, true);
   esp_task_wdt_add(NULL);
   Serial.println("Watchdog aktiviert (10s Timeout)");
 
-  //OTA_Start();
+  // OTA_Start();
 }
 
 void loop()
 {
   esp_task_wdt_reset();
+
+  if (canWriteUnlocked && millis() > canWriteUnlockUntil)
+  {
+    canWriteUnlocked = false;
+  }
 
   // CAN Bus-Off Recovery prüfen
   CAN_CheckAndRecoverBusOff();
@@ -96,6 +117,12 @@ void loop()
   if (OTA_On == 1)
   {
     ArduinoOTA.handle();
+    // OTA-Timeout prüfen
+    if (otaTimeoutMs > 0 && millis() - otaStartTime >= otaTimeoutMs)
+    {
+      Serial.println("[OTA] Timeout – OTA wird automatisch beendet");
+      OTA_Stop();
+    }
   }
 
   // Empfange CAN-Nachricht mit Timeout
@@ -106,34 +133,17 @@ void loop()
       CanInputOTA();
 
       // VE.Direct Ladespannungen lesen/setzen via CAN
-      if (rx_frame.identifier == Can_Solar_Cmd && rx_frame.data_length_code >= 1)
+      if (handleSolarCanCommand(rx_frame,
+                                canWriteUnlocked,
+                                canWriteUnlockUntil,
+                                CAN_WRITE_UNLOCK_WINDOW_MS,
+                                CAN_WRITE_UNLOCK_KEY1,
+                                CAN_WRITE_UNLOCK_KEY2))
       {
-        uint8_t cmd = rx_frame.data[0];
-        if (cmd == 0x10 || cmd == 0x12) {
-          // Lesen: Absorption (0x10) oder Float (0x12)
-          suppressTextMode();
-          float v = (cmd == 0x10) ? getAbsorptionVoltage() : getFloatVoltage();
-          uint16_t raw = (v > 0.0f) ? (uint16_t)(v * 100.0f) : 0;
-          uint8_t ok = (v > 0.0f) ? 0x00 : 0x01;
-          CAN_SendEx(true, 4, Can_Solar_Resp,
-                     cmd, ok, (raw >> 8) & 0xFF, raw & 0xFF);
-        } else if ((cmd == 0x11 || cmd == 0x13) && rx_frame.data_length_code >= 3) {
-          // Setzen: Absorption (0x11) oder Float (0x13)
-          uint16_t raw = ((uint16_t)rx_frame.data[1] << 8) | rx_frame.data[2];
-          float v = raw / 100.0f;
-          if (v >= 20.0f && v <= 35.0f) {
-            suppressTextMode();
-            bool ok;
-            if (cmd == 0x11) { setAbsorptionVoltage(v); ok = true; }
-            else             { setFloatVoltage(v);       ok = true; }
-            CAN_SendEx(true, 2, Can_Solar_Resp, cmd, ok ? 0x00 : 0x01);
-          } else {
-            CAN_SendEx(true, 2, Can_Solar_Resp, cmd, 0x01); // Spannung außerhalb Bereich
-          }
-        }
+        return;
       }
 
-      if (rx_frame.identifier == 0x25A)
+      if (rx_frame.identifier == OTA_On_Off && rx_frame.data_length_code == 2)
       {
         if (rx_frame.data[0] == 0x01 && rx_frame.data[1] == 0x00)
         {
@@ -177,9 +187,27 @@ void loop()
   if (dataUpdated)
     lastSolarDataTime = millis();
 
+  bool sensorUpdated = Sensors_Update();
+
+  if (sensorUpdated)
+  {
+    uint8_t ds18TempByte = 0xFF;
+    uint8_t dhtTempByte = 0xFF;
+    uint8_t dhtHumidityByte = 0xFF;
+    Sensors_GetCanBytes(ds18TempByte, dhtTempByte, dhtHumidityByte);
+    CAN_SendEx(true, 3, MessageSensorID, ds18TempByte, dhtTempByte, dhtHumidityByte);
+  }
+
   if (liveMode && dataUpdated)
   {
     SolarDatenAusgabe();
+    Sensors_Print();
+  }
+
+  // Falls gerade kein neuer Solar-Frame kam, bei Sensor-Update dennoch anzeigen.
+  if (liveMode && !dataUpdated && sensorUpdated)
+  {
+    Sensors_Print();
   }
 
   // CAN: Batteriespannung (mV), Ladestrom (A*10) und Leistung (W) senden bei neuen Reglerdaten

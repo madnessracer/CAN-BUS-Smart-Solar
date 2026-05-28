@@ -5,6 +5,10 @@
 #include <esp_task_wdt.h>
 #include "solar_data_receiver.h"
 
+constexpr uint8_t VE_HEX_MAX_RETRIES = 3;
+constexpr uint16_t VE_HEX_TIMEOUT_MS = 500;
+constexpr size_t VE_HEX_RAW_LIMIT = 192;
+
 // VE.Direct Checksumme berechnen (Bytes als Hex-Paare summieren)
 uint8_t calculateChecksum(String commandBody) {
   if (commandBody.length() % 2 != 0) {
@@ -350,7 +354,8 @@ void getChargerStatus() {
 }
 
 // Regler ein- oder ausschalten (Register 0x0200)
-void setChargerOnOff(bool on) {
+// Rückgabe: true bei bestätigter Antwort, sonst false
+bool setChargerOnOff(bool on) {
   enableRemoteControl();
 
   String valueHex = on ? "01" : "04";
@@ -372,8 +377,10 @@ void setChargerOnOff(bool on) {
   String expected = ":" + commandBody + checksumStr;
   if (raw.indexOf(expected) >= 0) {
     Serial.println(on ? "Regler eingeschaltet." : "Regler ausgeschaltet.");
+    return true;
   } else {
     Serial.println("Fehler beim Schalten. Antwort: " + raw);
+    return false;
   }
 }
 
@@ -394,78 +401,96 @@ static int veHexFindResponse(const String &raw, const String &prefix) {
   return idx;
 }
 
+// Antwort mit begrenzter Puffergröße lesen (reduziert Heap-Fragmentierung)
+static void veHexReadRaw(String &raw, unsigned long timeoutMs = VE_HEX_TIMEOUT_MS) {
+  raw = "";
+  raw.reserve(VE_HEX_RAW_LIMIT + 16);
+
+  unsigned long timeout = millis();
+  while (millis() - timeout < timeoutMs) {
+    esp_task_wdt_reset();
+    while (Serial2.available()) {
+      char c = (char)Serial2.read();
+      if (raw.length() < VE_HEX_RAW_LIMIT) {
+        raw += c;
+      }
+    }
+  }
+}
+
 // Battery type auf User defined setzen (0xEDF1 = 0xFF)
 // Pflicht vor dem Setzen von Absorption/Float-Spannung (Note 5)
 static bool setBatteryTypeUser() {
   String commandBody = "8F1ED00FF";
   uint8_t checksum = calculateChecksum(commandBody);
-  char checksumStr[3];
-  sprintf(checksumStr, "%02X", checksum);
+  char frame[24];
+  snprintf(frame, sizeof(frame), ":%s%02X\r\n", commandBody.c_str(), checksum);
 
-  while (Serial2.available()) Serial2.read();
-  Serial2.print(":" + commandBody + checksumStr + "\r\n");
+  for (uint8_t attempt = 0; attempt < VE_HEX_MAX_RETRIES; attempt++) {
+    while (Serial2.available()) Serial2.read();
+    Serial2.print(frame);
 
-  unsigned long timeout = millis();
-  String raw = "";
-  while (millis() - timeout < 500) {
-    esp_task_wdt_reset();
-    if (Serial2.available()) raw += (char)Serial2.read();
+    String raw;
+    veHexReadRaw(raw);
+    if (raw.indexOf(":8F1ED") >= 0) {
+      Serial.println("Battery type: User defined (0xFF) gesetzt.");
+      return true;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
-  if (raw.indexOf(":8F1ED") >= 0) {
-    Serial.println("Battery type: User defined (0xFF) gesetzt.");
-    return true;
-  }
-  Serial.println("Fehler: Battery type konnte nicht gesetzt werden. Antwort: " + raw);
+  Serial.println("Fehler: Battery type konnte nicht gesetzt werden.");
   return false;
 }
 
 // Hilfsfunktion: uint16-Register lesen, Ergebnis in outVal
 static bool veHexGetU16(const String &body, const String &prefix, uint16_t &outVal) {
   uint8_t checksum = calculateChecksum(body);
-  char checksumStr[3];
-  sprintf(checksumStr, "%02X", checksum);
+  char frame[24];
+  snprintf(frame, sizeof(frame), ":%s%02X\r\n", body.c_str(), checksum);
 
-  while (Serial2.available()) Serial2.read();
-  Serial2.print(":" + body + checksumStr + "\r\n");
+  for (uint8_t attempt = 0; attempt < VE_HEX_MAX_RETRIES; attempt++) {
+    while (Serial2.available()) Serial2.read();
+    Serial2.print(frame);
 
-  unsigned long timeout = millis();
-  String raw = "";
-  while (millis() - timeout < 500) {
-    esp_task_wdt_reset();
-    if (Serial2.available()) raw += (char)Serial2.read();
-  }
+    String raw;
+    veHexReadRaw(raw);
 
-  int idx = veHexFindResponse(raw, prefix);
-  if (idx >= 0 && raw.length() >= (size_t)(idx + 14)) {
-    char lo[3] = { raw[idx + 8], raw[idx + 9], '\0' };
-    char hi[3] = { raw[idx + 10], raw[idx + 11], '\0' };
-    outVal = ((uint8_t)strtol(hi, NULL, 16) << 8) | (uint8_t)strtol(lo, NULL, 16);
-    return true;
+    int idx = veHexFindResponse(raw, prefix);
+    if (idx >= 0 && raw.length() >= (size_t)(idx + 14)) {
+      char lo[3] = { raw[idx + 8], raw[idx + 9], '\0' };
+      char hi[3] = { raw[idx + 10], raw[idx + 11], '\0' };
+      outVal = ((uint8_t)strtol(hi, NULL, 16) << 8) | (uint8_t)strtol(lo, NULL, 16);
+      return true;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
   return false;
 }
 
 // Hilfsfunktion: uint16-Register setzen
 static bool veHexSetU16(const String &body, const String &prefix, float voltageV) {
+  (void)prefix;
   uint16_t value = (uint16_t)(voltageV * 100.0f);
   char hexValue[5];
   sprintf(hexValue, "%02X%02X", value & 0xFF, (value >> 8) & 0xFF);
 
   String commandBody = body + String(hexValue);
   uint8_t checksum = calculateChecksum(commandBody);
-  char checksumStr[3];
-  sprintf(checksumStr, "%02X", checksum);
+  char frame[28];
+  snprintf(frame, sizeof(frame), ":%s%02X\r\n", commandBody.c_str(), checksum);
 
-  while (Serial2.available()) Serial2.read();
-  Serial2.print(":" + commandBody + checksumStr + "\r\n");
+  for (uint8_t attempt = 0; attempt < VE_HEX_MAX_RETRIES; attempt++) {
+    while (Serial2.available()) Serial2.read();
+    Serial2.print(frame);
 
-  unsigned long timeout = millis();
-  String raw = "";
-  while (millis() - timeout < 500) {
-    esp_task_wdt_reset();
-    if (Serial2.available()) raw += (char)Serial2.read();
+    String raw;
+    veHexReadRaw(raw);
+    if (raw.indexOf(":" + commandBody) >= 0) {
+      return true;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
-  return raw.indexOf(":" + commandBody) >= 0;
+  return false;
 }
 
 // Absorption-Spannung lesen (Register 0xEDF7, un16, 0.01V)
@@ -496,23 +521,27 @@ float getFloatVoltage() {
 
 // Absorption-Spannung setzen (voltageV in Volt, z.B. 28.8)
 // Battery type wird automatisch auf User defined gesetzt
-void setAbsorptionVoltage(float voltageV) {
-  if (!setBatteryTypeUser()) return;
+bool setAbsorptionVoltage(float voltageV) {
+  if (!setBatteryTypeUser()) return false;
   if (veHexSetU16("8F7ED00", ":8F7ED", voltageV)) {
     Serial.printf("Absorption-Spannung gesetzt: %.2f V\n", voltageV);
+    return true;
   } else {
     Serial.println("Fehler beim Setzen (Absorption 0xEDF7).");
+    return false;
   }
 }
 
 // Float-Spannung setzen (voltageV in Volt, z.B. 27.2)
 // Battery type wird automatisch auf User defined gesetzt
-void setFloatVoltage(float voltageV) {
-  if (!setBatteryTypeUser()) return;
+bool setFloatVoltage(float voltageV) {
+  if (!setBatteryTypeUser()) return false;
   if (veHexSetU16("8F6ED00", ":8F6ED", voltageV)) {
     Serial.printf("Float-Spannung gesetzt: %.2f V\n", voltageV);
+    return true;
   } else {
     Serial.println("Fehler beim Setzen (Float 0xEDF6).");
+    return false;
   }
 }
 

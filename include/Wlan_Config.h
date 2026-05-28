@@ -12,6 +12,8 @@ static char password_buf[33] = {0};
 byte OTA_On = 0;
 int WiFi_Error = 0;
 bool wifiReconnectEnabled = false; // true erst nach erstem erfolgreichem OTA_Start()
+static unsigned long otaStartTime = 0;
+static unsigned long otaTimeoutMs = 5UL * 60UL * 1000UL; // Standard: 5 Minuten
 byte SSID_Speicher[50][33];
 byte SSID_Byte_arrey[33];
 String NeueSSID;
@@ -70,6 +72,7 @@ void OTA_Start()
   }
 
   ArduinoOTA.begin();
+  WiFi.setSleep(false); // Modem-Sleep deaktivieren – verhindert OTA-Stocken
 
   // Callbacks NACH begin() setzen
     ArduinoOTA.onStart([]() {
@@ -94,6 +97,8 @@ void OTA_Start()
     Serial.println("OTA Ende: Watchdog zurück auf 10s");
     incrementFirmwareVersion();
     CAN_SendEx(true, 1, IP_Send_to_CAN, 0x06);
+    WiFi.setSleep(true);
+    esp_task_wdt_delete(NULL);
     esp_task_wdt_init(10, true);
     esp_task_wdt_add(NULL);
   });
@@ -107,10 +112,13 @@ void OTA_Start()
     else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
     else if (error == OTA_END_ERROR) Serial.println("End Failed");
     CAN_SendEx(true, 1, IP_Send_to_CAN, 0x07);
+    WiFi.setSleep(true);
+    esp_task_wdt_delete(NULL);
     esp_task_wdt_init(10, true);
     esp_task_wdt_add(NULL); });
 
   OTA_On = 1;
+  otaStartTime = millis();
   wifiReconnectEnabled = true; // Reconnect wieder erlaubt nach erfolgreichem Start
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
