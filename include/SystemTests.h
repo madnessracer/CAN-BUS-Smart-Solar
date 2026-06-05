@@ -15,7 +15,8 @@
 extern unsigned long lastSolarDataTime;
 extern const unsigned long SOLAR_TIMEOUT_MS;
 extern bool canWriteUnlocked;
-extern unsigned long canWriteUnlockUntil;
+extern unsigned long canWriteUnlockStart;
+extern const unsigned long CAN_WRITE_UNLOCK_WINDOW_MS;
 
 inline void runSystemSelfTest()
 {
@@ -124,7 +125,8 @@ inline void runSystemSelfTest()
 
   if (canWriteUnlocked)
   {
-    unsigned long rem = (canWriteUnlockUntil > millis()) ? (canWriteUnlockUntil - millis()) : 0;
+    unsigned long _elapsed = millis() - canWriteUnlockStart;
+    unsigned long rem = (_elapsed < CAN_WRITE_UNLOCK_WINDOW_MS) ? (CAN_WRITE_UNLOCK_WINDOW_MS - _elapsed) : 0;
     report("CAN-Lock", 1, "Schreibfenster offen, Rest " + String(rem / 1000UL) + " s");
   }
   else

@@ -7,7 +7,7 @@
 
 #define FORMAT_LITTLEFS_IF_FAILED true
 
-char FileBuffer[32];
+char FileBuffer[64];
 String SSID;
 String PASSWORD;
 
@@ -267,7 +267,7 @@ String PASSWORD_Lesen()
 
 void SSID_Schreiben(String Wert)
 {
-    char arr[33];
+    char arr[64];
     Wert.toCharArray(arr, sizeof(arr));
     FS_Open();
     writeFile(LittleFS, "/SSID.txt", arr);
@@ -279,7 +279,7 @@ void SSID_Schreiben(String Wert)
 
 void PASSWORD_Schreiben(String Wert)
 {
-    char arr[33];
+    char arr[64];
     Wert.toCharArray(arr, sizeof(arr));
     FS_Open();
     writeFile(LittleFS, "/PASSWORD.txt", arr);
@@ -335,15 +335,17 @@ void incrementBootCount()
     //Serial.printf("Boot-Zähler erhöht auf: %lu\n", count);
 }
 
-// Persistentes Fehlerlog (Ringpuffer, max. 20 Einträge)
+// Fehlerlog im RAM (flüchtig – geht beim Reboot verloren)
 constexpr uint8_t ERROR_LOG_MAX_ENTRIES = 20;
-constexpr const char *ERROR_LOG_PATH = "/error_log.txt";
 constexpr unsigned long ERROR_LOG_DEDUP_WINDOW_DEFAULT_MS = 30000UL; // 30s: gleiche Fehler zusammenfassen
 constexpr unsigned long ERROR_LOG_DEDUP_WINDOW_MIN_MS = 1000UL;
 constexpr unsigned long ERROR_LOG_DEDUP_WINDOW_MAX_MS = 600000UL;
 
-static unsigned long g_errorLogDedupWindowMs = ERROR_LOG_DEDUP_WINDOW_DEFAULT_MS;
+// RAM-Ringpuffer: flüchtig, geht beim Reboot verloren
+static String g_errorLogRam[ERROR_LOG_MAX_ENTRIES];
+static uint8_t g_errorLogRamCount = 0;
 
+static unsigned long g_errorLogDedupWindowMs = ERROR_LOG_DEDUP_WINDOW_DEFAULT_MS;
 static String g_lastErrorLogMsg = "";
 static unsigned long g_lastErrorLogWriteMs = 0;
 static uint16_t g_lastErrorLogSuppressed = 0;
@@ -362,6 +364,13 @@ void ErrorLogSetDedupWindowMs(unsigned long ms)
     g_errorLogDedupWindowMs = ms;
 }
 
+inline void ErrorLogResetSuppression()
+{
+    g_lastErrorLogMsg = "";
+    g_lastErrorLogWriteMs = 0;
+    g_lastErrorLogSuppressed = 0;
+}
+
 inline String _sanitizeLogLine(String msg)
 {
     msg.replace("\r", " ");
@@ -374,12 +383,26 @@ inline String _sanitizeLogLine(String msg)
     return msg;
 }
 
+static void _errorLogRamAppend(const String &line)
+{
+    if (g_errorLogRamCount < ERROR_LOG_MAX_ENTRIES)
+    {
+        g_errorLogRam[g_errorLogRamCount++] = line;
+    }
+    else
+    {
+        for (uint8_t i = 1; i < ERROR_LOG_MAX_ENTRIES; i++)
+            g_errorLogRam[i - 1] = g_errorLogRam[i];
+        g_errorLogRam[ERROR_LOG_MAX_ENTRIES - 1] = line;
+    }
+}
+
 void ErrorLogInit()
 {
-    FS_Open();
-    File f = LittleFS.open(ERROR_LOG_PATH, FILE_APPEND);
-    if (f) f.close();
-    FS_Close();
+    g_errorLogRamCount = 0;
+    g_lastErrorLogMsg = "";
+    g_lastErrorLogWriteMs = 0;
+    g_lastErrorLogSuppressed = 0;
 }
 
 void ErrorLogAdd(String message)
@@ -395,86 +418,27 @@ void ErrorLogAdd(String message)
         return;
     }
 
-    String lines[ERROR_LOG_MAX_ENTRIES];
-    uint8_t count = 0;
-
-    FS_Open();
-
-    File in = LittleFS.open(ERROR_LOG_PATH, FILE_READ);
-    if (in)
-    {
-        while (in.available())
-        {
-            String line = in.readStringUntil('\n');
-            line.trim();
-            if (line.length() == 0)
-                continue;
-
-            if (count < ERROR_LOG_MAX_ENTRIES)
-            {
-                lines[count++] = line;
-            }
-            else
-            {
-                for (uint8_t i = 1; i < ERROR_LOG_MAX_ENTRIES; i++)
-                    lines[i - 1] = lines[i];
-                lines[ERROR_LOG_MAX_ENTRIES - 1] = line;
-            }
-        }
-        in.close();
-    }
-
     // Falls Wiederholungen unterdrückt wurden, als Sammelzeile dokumentieren.
     if (g_lastErrorLogSuppressed > 0)
     {
         String summary = "[" + String(nowMs) + " ms] " + g_lastErrorLogMsg +
                          " (" + String(g_lastErrorLogSuppressed) + "x wiederholt, unterdrueckt)";
-        if (count < ERROR_LOG_MAX_ENTRIES)
-        {
-            lines[count++] = summary;
-        }
-        else
-        {
-            for (uint8_t i = 1; i < ERROR_LOG_MAX_ENTRIES; i++)
-                lines[i - 1] = lines[i];
-            lines[ERROR_LOG_MAX_ENTRIES - 1] = summary;
-        }
+        _errorLogRamAppend(summary);
         g_lastErrorLogSuppressed = 0;
     }
 
     String entry = "[" + String(nowMs) + " ms] " + cleanMessage;
-    if (count < ERROR_LOG_MAX_ENTRIES)
-    {
-        lines[count++] = entry;
-    }
-    else
-    {
-        for (uint8_t i = 1; i < ERROR_LOG_MAX_ENTRIES; i++)
-            lines[i - 1] = lines[i];
-        lines[ERROR_LOG_MAX_ENTRIES - 1] = entry;
-    }
+    _errorLogRamAppend(entry);
 
-    File out = LittleFS.open(ERROR_LOG_PATH, "w");
-    if (out)
-    {
-        for (uint8_t i = 0; i < count; i++)
-            out.println(lines[i]);
-        out.close();
-
-        g_lastErrorLogMsg = cleanMessage;
-        g_lastErrorLogWriteMs = nowMs;
-    }
-
-    FS_Close();
+    g_lastErrorLogMsg = cleanMessage;
+    g_lastErrorLogWriteMs = nowMs;
 }
 
 void ErrorLogClear()
 {
-    FS_Open();
-    File f = LittleFS.open(ERROR_LOG_PATH, FILE_WRITE);
-    if (f) f.close();
-    FS_Close();
-
+    g_errorLogRamCount = 0;
+    for (uint8_t i = 0; i < ERROR_LOG_MAX_ENTRIES; i++)
+        g_errorLogRam[i] = "";
     g_lastErrorLogMsg = "";
     g_lastErrorLogWriteMs = 0;
     g_lastErrorLogSuppressed = 0;
@@ -482,33 +446,17 @@ void ErrorLogClear()
 
 void ErrorLogPrint()
 {
-    FS_Open();
-    File file = LittleFS.open(ERROR_LOG_PATH, FILE_READ);
-    if (!file)
+    Serial.println("----- Fehlerlog (letzte 20, RAM) -----");
+    if (g_errorLogRamCount == 0)
     {
-        Serial.println("Fehlerlog: leer.");
-        FS_Close();
-        return;
-    }
-
-    Serial.println("----- Fehlerlog (letzte 20) -----");
-    uint8_t idx = 1;
-    bool hasLine = false;
-    while (file.available())
-    {
-        String line = file.readStringUntil('\n');
-        line.trim();
-        if (line.length() == 0)
-            continue;
-        hasLine = true;
-        Serial.printf("%02u) %s\n", idx++, line.c_str());
-    }
-    if (!hasLine)
         Serial.println("(leer)");
+    }
+    else
+    {
+        for (uint8_t i = 0; i < g_errorLogRamCount; i++)
+            Serial.printf("%02u) %s\n", i + 1, g_errorLogRam[i].c_str());
+    }
     Serial.println("-------------------------------");
-
-    file.close();
-    FS_Close();
 }
 
 #endif

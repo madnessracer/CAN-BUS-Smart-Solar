@@ -35,7 +35,7 @@ bool liveMode = false;
 // Globale Variablen für CAN (falls später benötigt)
 gpio_num_t s_txPin;
 gpio_num_t s_rxPin;
-uint8_t s_rxQueueLen = 50; // rxQueueLen = 50 (anpassbar)
+uint8_t s_rxQueueLen = 20;
 
 // VE.Direct Stillstand-Erkennung
 unsigned long lastSolarDataTime = 0;
@@ -47,7 +47,7 @@ const unsigned long WIFI_RETRY_INTERVAL_MS = 60000; // 60s
 
 // CAN-Schutz: Setzbefehle nur in zeitlich begrenztem Freigabe-Fenster erlauben
 bool canWriteUnlocked = false;
-unsigned long canWriteUnlockUntil = 0;
+unsigned long canWriteUnlockStart = 0; // millis() bei Freigabe (überlaufsicher)
 const unsigned long CAN_WRITE_UNLOCK_WINDOW_MS = 60000; // 60s
 const uint8_t CAN_WRITE_UNLOCK_KEY1 = 0xA5;
 const uint8_t CAN_WRITE_UNLOCK_KEY2 = 0x5A;
@@ -63,7 +63,6 @@ void setup()
 
   incrementBootCount();
   Serial.printf("Firmware-Version: %lu, Boot-Zähler: %lu\n", getFirmwareVersion(), getBootCount());
-  ErrorLogInit();
 
   FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(13);
@@ -77,6 +76,7 @@ void setup()
   digitalWrite(CAN_SE_PIN, LOW);
   pinMode(PIN_5V_EN, OUTPUT);
   digitalWrite(PIN_5V_EN, HIGH);
+  
   delay(100); // Kurze Verzögerung, um sicherzustellen, dass der Transceiver bereit ist
   Serial.println("CAN SE (GPIO23) als OUTPUT gesetzt (Can Transceiver aktiv)");
 
@@ -90,9 +90,6 @@ void setup()
     Serial.println("TWAI (CAN) initialisiert mit 250 kbit/s");
   }
 
-  // Serial.print("CAN SPEED :");
-  // Serial.println(CAN_cfg.speed);
-  delay(500); // Kurz warten damit andere CAN-Teilnehmer bereit sind
   CAN_SendEx(true, 1, IP_Send_to_CAN, 0x03);
 
   esp_task_wdt_init(WDT_TIMEOUT_SEC, true);
@@ -106,7 +103,7 @@ void loop()
 {
   esp_task_wdt_reset();
 
-  if (canWriteUnlocked && millis() > canWriteUnlockUntil)
+  if (canWriteUnlocked && (millis() - canWriteUnlockStart) >= CAN_WRITE_UNLOCK_WINDOW_MS)
   {
     canWriteUnlocked = false;
   }
@@ -117,12 +114,6 @@ void loop()
   if (OTA_On == 1)
   {
     ArduinoOTA.handle();
-    // OTA-Timeout prüfen
-    if (otaTimeoutMs > 0 && millis() - otaStartTime >= otaTimeoutMs)
-    {
-      Serial.println("[OTA] Timeout – OTA wird automatisch beendet");
-      OTA_Stop();
-    }
   }
 
   // Empfange CAN-Nachricht mit Timeout
@@ -133,15 +124,12 @@ void loop()
       CanInputOTA();
 
       // VE.Direct Ladespannungen lesen/setzen via CAN
-      if (handleSolarCanCommand(rx_frame,
-                                canWriteUnlocked,
-                                canWriteUnlockUntil,
-                                CAN_WRITE_UNLOCK_WINDOW_MS,
-                                CAN_WRITE_UNLOCK_KEY1,
-                                CAN_WRITE_UNLOCK_KEY2))
-      {
-        return;
-      }
+      handleSolarCanCommand(rx_frame,
+                            canWriteUnlocked,
+                            canWriteUnlockStart,
+                            CAN_WRITE_UNLOCK_WINDOW_MS,
+                            CAN_WRITE_UNLOCK_KEY1,
+                            CAN_WRITE_UNLOCK_KEY2);
 
       if (rx_frame.identifier == OTA_On_Off && rx_frame.data_length_code == 2)
       {

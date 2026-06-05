@@ -54,7 +54,7 @@ constexpr uint16_t IP_Send_to_CAN = 0x4EC;  // 1260 dezimal
 #elif defined(SOLAR_RECHTS)
 
 constexpr char WIFI_Name[] = "Solar rechts";
-constexpr uint8_t OtaDevieID = 0x0C;        // 12 dezimal
+constexpr uint8_t OtaDevieID = 0x64;        // 100 dezimal
 
 constexpr uint16_t MessageBasisID = 0x500;  // 1280 dezimal
 constexpr uint16_t MessageBasisID1 = 0x501; // 1281 dezimal

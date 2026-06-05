@@ -11,7 +11,7 @@
 
 inline bool handleSolarCanCommand(const twai_message_t &frame,
                                   bool &canWriteUnlocked,
-                                  unsigned long &canWriteUnlockUntil,
+                                  unsigned long &canWriteUnlockStart,
                                   unsigned long unlockWindowMs,
                                   uint8_t unlockKey1,
                                   uint8_t unlockKey2)
@@ -29,7 +29,7 @@ inline bool handleSolarCanCommand(const twai_message_t &frame,
     if (frame.data[1] == unlockKey1 && frame.data[2] == unlockKey2)
     {
       canWriteUnlocked = true;
-      canWriteUnlockUntil = millis() + unlockWindowMs;
+      canWriteUnlockStart = millis(); // Startzeit merken – Prüfung überlaufsicher via (millis()-canWriteUnlockStart)
       CAN_SendEx(true, 2, Can_Solar_Resp, cmd, 0x00);
     }
     else

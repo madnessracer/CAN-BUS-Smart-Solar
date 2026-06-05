@@ -3,11 +3,17 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <cstring>
+#include <esp_task_wdt.h>
 #include "VE_HEX.h"
 #include "solar_data_receiver.h"
 #include "FileSystem.h"
 #include "Wlan_Config.h"
 #include "SensorManager.h"
+#include "CAN_SUBs.h"
+
+static constexpr uint32_t CANPING_REQUEST_ID = 0x1FFFFF03UL;
+static constexpr uint32_t CANPING_RESPONSE_ID = 0x1FFFFF04UL;
 
 extern bool debugMode;
 extern bool liveMode;
@@ -28,6 +34,212 @@ static WifiStep wifiStep = WIFI_MENU;
 void handleDebugMenu(String input);
 void runSystemSelfTest();
 void runCanBusQuickTest(uint16_t frameCount);
+
+static inline void serviceWatchdogAndYield()
+{
+  // Lange Testschleifen laufen im loop()-Task: WDT bedienen und Scheduler kurz freigeben.
+  esp_task_wdt_reset();
+  delay(0);
+}
+
+static uint32_t parseHexOrDec(const String &value)
+{
+  String s = value;
+  s.trim();
+  if (s.startsWith("0x") || s.startsWith("0X")) {
+    return (uint32_t)strtoul(s.c_str() + 2, nullptr, 16);
+  }
+  return (uint32_t)strtoul(s.c_str(), nullptr, 10);
+}
+
+static bool validatePingResponse(uint8_t seq, const uint8_t expected[8], const twai_message_t &frame)
+{
+  if (!frame.extd || frame.data_length_code < 8) {
+    return false;
+  }
+  if (frame.data[0] != seq) {
+    return false;
+  }
+  return memcmp(frame.data + 1, expected + 1, 7) == 0;
+}
+
+static void runCanBusPingSendTest(uint16_t count)
+{
+  const uint32_t requestId = CANPING_REQUEST_ID;
+
+  if (count < 1) {
+    count = 1;
+  } else if (count > 10000) {
+    count = 10000;
+  }
+
+  twai_status_info_t status = {};
+  if (twai_get_status_info(&status) != ESP_OK) {
+    Serial.println("[FAIL] CAN-Status konnte nicht gelesen werden.");
+    return;
+  }
+  if (status.state == TWAI_STATE_BUS_OFF) {
+    Serial.println("[FAIL] CAN-Bus ist BUS_OFF. Bitte Bus/Abschluss prüfen.");
+    return;
+  }
+
+  Serial.write(0x00);
+  Serial.println("----- CAN Sendetest (ohne RTT) -----");
+  Serial.printf("ID: 0x%08X | Frames: %u\n", (unsigned)requestId, count);
+
+  twai_status_info_t statusBefore = {};
+  twai_get_status_info(&statusBefore);
+  uint16_t oldDelayMs = CAN_GetInterMsgDelayMs();
+  CAN_SetInterMsgDelayMs(0);
+
+  unsigned long startUs = micros();
+  for (uint16_t i = 0; i < count; ++i)
+  {
+    if ((i & 0x3F) == 0) {
+      serviceWatchdogAndYield();
+    }
+
+    uint8_t seq = (uint8_t)(i + 1);
+    uint8_t payload[8] = {seq, (uint8_t)(0x11 + i), (uint8_t)(0x22 + i), (uint8_t)(0x33 + i),
+                          (uint8_t)(0x44 + i), (uint8_t)(0x55 + i), (uint8_t)(0x66 + i), (uint8_t)(0x77 + i)};
+
+    CAN_SendEx(true, 8, requestId,
+               payload[0], payload[1], payload[2], payload[3],
+               payload[4], payload[5], payload[6], payload[7]);
+  }
+  unsigned long elapsedUs = micros() - startUs;
+  CAN_SetInterMsgDelayMs(oldDelayMs);
+
+  twai_status_info_t statusAfter = {};
+  twai_get_status_info(&statusAfter);
+
+  unsigned long elapsedMs = elapsedUs / 1000UL;
+  if (elapsedMs == 0) elapsedMs = 1;
+
+  float fps = (count * 1000.0f) / (float)elapsedMs;
+  float avgUsPerFrame = (float)elapsedUs / (float)count;
+  float payloadKbitPerSec = (fps * 64.0f) / 1000.0f; // 8 Byte Daten = 64 Bit Nutzlast pro Frame
+  uint32_t txFailedDelta = statusAfter.tx_failed_count - statusBefore.tx_failed_count;
+  uint32_t txOk = (txFailedDelta >= count) ? 0 : (count - txFailedDelta);
+  float txSuccessPct = (count > 0) ? ((float)txOk * 100.0f / (float)count) : 0.0f;
+
+  Serial.printf("Dauer: %lu ms | Rate: %.1f Frames/s | Delay waehrend Test: 0 ms (normal: %u ms)\n",
+                elapsedMs, fps, oldDelayMs);
+  Serial.printf("Mittel: %.1f us/Frame | Nutzlastrate: %.1f kbit/s\n", avgUsPerFrame, payloadKbitPerSec);
+  Serial.printf("TX erfolgreich: %lu/%u (%.1f%%) | TX failed delta: %lu\n",
+                (unsigned long)txOk, count, txSuccessPct, (unsigned long)txFailedDelta);
+}
+
+static void runCanBusPingTest(uint16_t count, uint16_t timeoutMs = 20)
+{
+  const uint32_t requestId = CANPING_REQUEST_ID;
+  const uint32_t responseId = CANPING_RESPONSE_ID;
+
+  Serial.write(0x00);
+  Serial.println("----- CAN-Ping Qualitaetstest (Fast-Mode) -----");
+  Serial.printf("Request-ID:  0x%08X\n", (unsigned)requestId);
+  Serial.printf("Response-ID: 0x%08X\n", (unsigned)responseId);
+  Serial.printf("Anzahl Pakete: %u\n", count);
+  Serial.printf("Timeout je Ping: %u ms\n", timeoutMs);
+
+  if (count < 1) {
+    count = 1;
+  } else if (count > 10000) {
+    count = 10000;
+  }
+  if (timeoutMs < 1) {
+    timeoutMs = 1;
+  } else if (timeoutMs > 2000) {
+    timeoutMs = 2000;
+  }
+
+  twai_status_info_t status = {};
+  if (twai_get_status_info(&status) != ESP_OK) {
+    Serial.println("[FAIL] CAN-Status konnte nicht gelesen werden.");
+    return;
+  }
+  if (status.state == TWAI_STATE_BUS_OFF) {
+    Serial.println("[FAIL] CAN-Bus ist BUS_OFF. Bitte Bus/Abschluss prüfen.");
+    return;
+  }
+
+  uint16_t success = 0;
+  uint16_t lost = 0;
+  unsigned long minRttUs = 0xFFFFFFFFUL;
+  unsigned long maxRttUs = 0;
+  unsigned long totalRttUs = 0;
+
+  twai_status_info_t statusBefore = {};
+  twai_get_status_info(&statusBefore);
+  uint16_t oldDelayMs = CAN_GetInterMsgDelayMs();
+  CAN_SetInterMsgDelayMs(0);
+
+  // Alte Frames verwerfen, damit nur Antworten auf diesen Test ausgewertet werden.
+  twai_message_t frame = {};
+  while (twai_receive(&frame, 0) == ESP_OK) {}
+
+  unsigned long testStartUs = micros();
+
+  for (uint16_t i = 0; i < count; ++i)
+  {
+    if ((i & 0x1F) == 0) {
+      serviceWatchdogAndYield();
+    }
+
+    uint8_t seq = (uint8_t)(i + 1);
+    uint8_t payload[8] = {seq, (uint8_t)(0x11 + i), (uint8_t)(0x22 + i), (uint8_t)(0x33 + i),
+                          (uint8_t)(0x44 + i), (uint8_t)(0x55 + i), (uint8_t)(0x66 + i), (uint8_t)(0x77 + i)};
+
+    CAN_SendEx(true, 8, requestId, payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7]);
+    unsigned long startUs = micros();
+    bool gotResponse = false;
+
+    while ((micros() - startUs) < (timeoutMs * 1000UL)) {
+      if (twai_receive(&frame, 0) == ESP_OK) {
+        if (frame.identifier == responseId && validatePingResponse(seq, payload, frame)) {
+          unsigned long rttUs = micros() - startUs;
+          success++;
+          totalRttUs += rttUs;
+          if (rttUs < minRttUs) minRttUs = rttUs;
+          if (rttUs > maxRttUs) maxRttUs = rttUs;
+          gotResponse = true;
+          break;
+        }
+      } else {
+        // Bei leerer RX-Queue kurz kooperativ abgeben, damit Idle-Task/WDT nicht verhungert.
+        delay(0);
+      }
+    }
+
+    if (!gotResponse) {
+      lost++;
+    }
+  }
+
+  unsigned long elapsedUs = micros() - testStartUs;
+  unsigned long elapsedMs = elapsedUs / 1000UL;
+  if (elapsedMs == 0) elapsedMs = 1;
+  CAN_SetInterMsgDelayMs(oldDelayMs);
+
+  twai_status_info_t statusAfter = {};
+  twai_get_status_info(&statusAfter);
+
+  Serial.println("----- Ergebnis -----");
+  Serial.printf("Gesendet: %u, Erfolgreich: %u, Verloren: %u\n", count, success, lost);
+  float successPct = (count > 0) ? ((float)success * 100.0f / (float)count) : 0.0f;
+  Serial.printf("Erfolgsquote: %.1f%%\n", successPct);
+  float reqRate = (count * 1000.0f) / (float)elapsedMs;
+  float okRate = (success * 1000.0f) / (float)elapsedMs;
+  Serial.printf("Dauer: %lu ms | Request-Rate: %.1f/s | Erfolgs-Rate: %.1f/s\n", elapsedMs, reqRate, okRate);
+
+  uint32_t txFailedDelta = statusAfter.tx_failed_count - statusBefore.tx_failed_count;
+  Serial.printf("TX failed delta: %lu\n", (unsigned long)txFailedDelta);
+
+  if (success > 0) {
+    Serial.printf("RTT Min: %lums, Max: %lums, Mittel: %lums\n",
+                  minRttUs / 1000UL, maxRttUs / 1000UL, (totalRttUs / success) / 1000UL);
+  }
+}
 
 void handleWifiMenu(String input) {
   if (input == "wifi help") {
@@ -114,13 +326,16 @@ void handleDebugMenu(String input) {
     Serial.println("ota ein/aus/status    - OTA-Update starten, beenden oder Status anzeigen");
     Serial.println("ota timeout <min>     - OTA Auto-Aus Zeit setzen (0 = deaktiviert)");
     Serial.println("selftest              - Systemtest (CAN, VE.Direct, Werte, OTA/WiFi)");
-    Serial.println("cantest [n]           - CAN-Leitungstest mit n Frames (Standard 3, max 500)");
+    Serial.println("cantest [n]           - CAN-Leitungstest mit n Frames (Standard 3, max 10000)");
+    Serial.println("canping [n] [to]      - Fast-Ping Qualitaetstest (Req/Resp), n=Pakete (max 10000), to=Timeout ms (1..2000, default 20)");
+    Serial.println("canpingtx [n]         - Reiner CAN-Sendetest mit fester ID (Fast-Mode, ohne RTT), Standard n=100");
     Serial.println("log             - Letzte 20 Fehler anzeigen");
     Serial.println("log test        - Testeintrag ins Fehlerlog schreiben");
     Serial.println("log info        - Fehlerlog-Status (Fenster, Limits)");
     Serial.println("log window <s>  - Dedupe-Fenster setzen (1..600s)");
     Serial.println("log clear       - Fehlerlog löschen");
     Serial.println("live                  - Solardaten live anzeigen (beliebige Taste beendet)");
+    Serial.println("dht live              - DHT22 live anzeigen, jede Sekunde (beliebige Taste beendet)");
     Serial.println("sensor                - Letzte DHT22/DS18B20 Messwerte anzeigen");
     Serial.println("sensor update         - Sofortige Sensor-Neumessung ausfuehren");
     Serial.println("hex <cmd>             - Direkt HEX-Befehl senden (z.B. 'hex :7F0ED0071')");
@@ -271,10 +486,48 @@ void handleDebugMenu(String input) {
     runCanBusQuickTest(3);
   } else if (input.startsWith("cantest ")) {
     uint16_t n = (uint16_t)input.substring(8).toInt();
-    if (n < 1 || n > 500) {
-      Serial.println("Ungueltig. Bereich: 1..500 Frames.");
+    if (n < 1 || n > 10000) {
+      Serial.println("Ungueltig. Bereich: 1..10000 Frames.");
     } else {
       runCanBusQuickTest(n);
+    }
+  } else if (input == "canping") {
+    runCanBusPingTest(5, 20);
+  } else if (input.startsWith("canping ")) {
+    String params = input.substring(8);
+    params.trim();
+    if (params.length() == 0) {
+      runCanBusPingTest(5, 20);
+    } else {
+      int split = params.indexOf(' ');
+      String countStr = (split >= 0) ? params.substring(0, split) : params;
+      String timeoutStr = (split >= 0) ? params.substring(split + 1) : "";
+      countStr.trim();
+      timeoutStr.trim();
+
+      uint32_t countRaw = parseHexOrDec(countStr);
+      uint32_t timeoutRaw = timeoutStr.length() > 0 ? parseHexOrDec(timeoutStr) : 20;
+      uint16_t count = (uint16_t)countRaw;
+      uint16_t timeoutMs = (uint16_t)timeoutRaw;
+
+      if (countRaw < 1 || countRaw > 10000) {
+        Serial.println("Ungueltig. Count muss zwischen 1 und 10000 liegen.");
+      } else if (timeoutRaw < 1 || timeoutRaw > 2000) {
+        Serial.println("Ungueltig. Timeout muss zwischen 1 und 2000 ms liegen.");
+      } else {
+        runCanBusPingTest(count, timeoutMs);
+      }
+    }
+  } else if (input == "canpingtx") {
+    runCanBusPingSendTest(100);
+  } else if (input.startsWith("canpingtx ")) {
+    String nParam = input.substring(10);
+    nParam.trim();
+    uint16_t count = (uint16_t)parseHexOrDec(nParam);
+    if (count < 1 || count > 10000) {
+      Serial.println("Ungueltig. Count muss zwischen 1 und 10000 liegen.");
+    } else {
+      runCanBusPingSendTest(count);
     }
   } else if (input == "log") {
     ErrorLogPrint();
@@ -298,6 +551,31 @@ void handleDebugMenu(String input) {
   } else if (input == "log clear") {
     ErrorLogClear();
     Serial.println("Fehlerlog gelöscht.");
+  } else if (input == "dht live") {
+    Serial.println("DHT22 Live-Modus. Beliebige Taste zum Beenden.");
+    while (true) {
+      esp_task_wdt_reset();
+      if (Serial.available()) {
+        Serial.read();
+        Serial.write(0x00);
+        Serial.println("DHT22 Live-Modus beendet.");
+        handleDebugMenu("help");
+        break;
+      }
+      Sensors_ForceUpdate();
+      const AmbientSensorData &s = Sensors_GetData();
+      if (s.dhtValid) {
+        Serial.printf("DHT22: Temp=%.1f C  Feuchte=%.1f %%\n", s.dhtTempC, s.dhtHumidity);
+      } else {
+        Serial.println("DHT22: ungueltig");
+      }
+      unsigned long wait = millis() + 1000;
+      while (millis() < wait) {
+        esp_task_wdt_reset();
+        if (Serial.available()) break;
+        delay(10);
+      }
+    }
   } else if (input == "live") {
     liveMode = true;
     Serial.println("Live-Modus aktiv. Beliebige Taste zum Beenden.");

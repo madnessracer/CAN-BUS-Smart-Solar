@@ -3,7 +3,7 @@
 
 #include <Arduino.h>
 
-bool dataUpdated = false;
+static bool dataUpdated = false;
 
 // Struktur für Solardaten
 struct SolarData
@@ -27,21 +27,21 @@ struct SolarData
 // Globale Instanz der Solardaten
 SolarData solarData;
 
-// Flags für empfangene Labels
-bool vReceived = false;
-bool iReceived = false;
-bool vpvReceived = false;
-bool ppvReceived = false;
-bool csReceived = false;
-bool mpptReceived = false;
-bool orReceived = false;
-bool errReceived = false;
-bool h19Received = false;
-bool h20Received = false;
-bool h21Received = false;
-bool h22Received = false;
-bool h23Received = false;
-bool hsdsReceived = false;
+// Flags für empfangene Labels (static: nur innerhalb dieser TU sichtbar)
+static bool vReceived = false;
+static bool iReceived = false;
+static bool vpvReceived = false;
+static bool ppvReceived = false;
+static bool csReceived = false;
+static bool mpptReceived = false;
+static bool orReceived = false;
+static bool errReceived = false;
+static bool h19Received = false;
+static bool h20Received = false;
+static bool h21Received = false;
+static bool h22Received = false;
+static bool h23Received = false;
+static bool hsdsReceived = false;
 
 // Inline-Funktion zum Zurücksetzen der Flags
 inline void resetFlags()
