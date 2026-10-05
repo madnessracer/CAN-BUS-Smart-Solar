@@ -9,6 +9,14 @@
 #include "FileSystem.h"
 #include "VE_HEX.h"
 
+extern bool batteryLeftKnown;
+extern bool batteryRightKnown;
+extern bool batteryLeftOn;
+extern bool batteryRightOn;
+extern bool batteryLeftError;
+extern bool batteryRightError;
+extern bool manualOffActive;
+
 inline bool handleSolarCanCommand(const twai_message_t &frame,
                                   bool &canWriteUnlocked,
                                   unsigned long &canWriteUnlockStart,
@@ -66,12 +74,41 @@ inline bool handleSolarCanCommand(const twai_message_t &frame,
       return true;
     }
 
-    suppressTextMode();
-    bool ok = setChargerOnOff(cmd == 0x14);
-    if (!ok)
+    bool allowCommand = true;
+    if (cmd == 0x14)
     {
-      ErrorLogAdd(cmd == 0x14 ? "Regler EIN fehlgeschlagen" : "Regler AUS fehlgeschlagen");
+      bool anyBatteryOn = (batteryLeftKnown && batteryLeftOn) || (batteryRightKnown && batteryRightOn);
+      bool bothErrorOrOff = ((batteryLeftKnown && !batteryLeftOn) || batteryLeftError) &&
+                            ((batteryRightKnown && !batteryRightOn) || batteryRightError);
+      if (!anyBatteryOn || bothErrorOrOff)
+      {
+        Serial.println("[CAN] Manuelles Einschalten untersagt: keine Batterie verfügbar oder beide Batterien fehlerhaft/aus.");
+        allowCommand = false;
+      }
     }
+
+    bool ok = false;
+    if (allowCommand)
+    {
+      suppressTextMode();
+      ok = setChargerOnOff(cmd == 0x14);
+      if (!ok)
+      {
+        ErrorLogAdd(cmd == 0x14 ? "Regler EIN fehlgeschlagen" : "Regler AUS fehlgeschlagen");
+      }
+      else
+      {
+        if (cmd == 0x15)
+        {
+          manualOffActive = true;
+        }
+        else if (cmd == 0x14)
+        {
+          manualOffActive = false;
+        }
+      }
+    }
+
     CAN_SendEx(true, 2, Can_Solar_Resp, cmd, ok ? 0x00 : 0x01);
     return false;
   }

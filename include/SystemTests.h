@@ -150,7 +150,6 @@ inline void runSystemSelfTest()
     else
     {
       report("DHT22", 2, "Ungueltiger Messwert");
-      ErrorLogAdd("Systemtest FAIL: DHT22 ungueltig");
     }
 
     if (sensorData.ds18Valid)

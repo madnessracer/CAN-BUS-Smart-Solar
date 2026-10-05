@@ -4,15 +4,18 @@
 #include <ArduinoOTA.h>
 #include <FastLED.h>
 #include <config.h>
-#include "solar_data_receiver.h"
 #include <FS.h>
 #include <LittleFS.h>
 #include "Can-Bus IDs.h"
 #include "driver/twai.h"
 #include <esp_task_wdt.h> // *** WATCHDOG
+#include <esp_system.h>   // esp_reset_reason()
 
 #define WDT_TIMEOUT_SEC 10 // *** WATCHDOG
 
+#include <SerialBridge.h>
+#define Serial SerialBridge
+#include "solar_data_receiver.h"
 #include <FileSystem.h>
 #include <CAN_SUBs.h>
 #include <Wlan_Config.h>
@@ -22,6 +25,7 @@
 #include <CanCommandHandler.h>
 #include <SensorManager.h>
 #include <debug_menu.h>
+#include <UnixTime.h>
 
 // Globale Variablen für LED-Blinken
 CRGB leds[NUM_LEDS];
@@ -31,6 +35,23 @@ bool ledBlinking = false;
 // Debug-Modus
 bool debugMode = false;
 bool liveMode = false;
+
+bool batteryLeftKnown = false;
+bool batteryRightKnown = false;
+bool batteryLeftOn = false;
+bool batteryRightOn = false;
+bool batteryLeftEmergency = false;
+bool batteryRightEmergency = false;
+bool batteryLeftError = false;
+bool batteryRightError = false;
+unsigned long batteryLeftLastSeen = 0;
+unsigned long batteryRightLastSeen = 0;
+bool batteryStartupCheckDone = false;
+static constexpr uint8_t BATTERY_STATUS_ON_BIT = 0x10;
+static constexpr uint8_t BATTERY_STATUS_ERROR_BIT = 0x40;
+static constexpr uint8_t BATTERY_STATUS_EMERGENCY_BIT = 0x80;
+static constexpr unsigned long BATTERY_STATUS_TIMEOUT_MS = 5000;
+bool manualOffActive = false;
 
 // Globale Variablen für CAN (falls später benötigt)
 gpio_num_t s_txPin;
@@ -61,8 +82,53 @@ void setup()
   Serial.println();
   Serial.println("Bootvorgang gestartet... " + String(WIFI_Name));
 
+  Serial.println("OTA-Standardzugangsdaten setzen");
+  SSID_Schreiben("ota");
+  PASSWORD_Schreiben("x756iklx756ikl");
+
   incrementBootCount();
   Serial.printf("Firmware-Version: %lu, Boot-Zähler: %lu\n", getFirmwareVersion(), getBootCount());
+
+  // Gespeicherten Fehlerlog laden
+  ErrorLogLoad();
+
+  // Reset-Grund ermitteln und ins Log schreiben
+  {
+    esp_reset_reason_t reason = esp_reset_reason();
+    const char *reasonStr = "Unbekannt";
+    bool suppressLog = false;
+    switch (reason) {
+      case ESP_RST_POWERON:   reasonStr = "Neustart: Einschalten (Power-On)"; break;
+      case ESP_RST_SW:
+        if (OTA_UpdatePendingReset())
+        {
+          reasonStr = "Neustart: OTA Update";
+          suppressLog = true;
+        }
+        else
+        {
+          reasonStr = "Neustart: Software-Reset";
+        }
+        break;
+      case ESP_RST_PANIC:     reasonStr = "Neustart: Crash/Panic"; break;
+      case ESP_RST_INT_WDT:   reasonStr = "Neustart: Interrupt-Watchdog"; break;
+      case ESP_RST_TASK_WDT:  reasonStr = "Neustart: Task-Watchdog (Haenger)"; break;
+      case ESP_RST_WDT:       reasonStr = "Neustart: Watchdog"; break;
+      case ESP_RST_DEEPSLEEP: reasonStr = "Neustart: Deep-Sleep Wake"; break;
+      case ESP_RST_BROWNOUT:  reasonStr = "Neustart: Unterspannung (Brownout)"; break;
+      case ESP_RST_SDIO:      reasonStr = "Neustart: SDIO"; break;
+      default: break;
+    }
+    if (suppressLog)
+    {
+      OTA_ClearPendingReset();
+    }
+    Serial.printf("[Reset-Grund] %s\n", reasonStr);
+    if (!suppressLog)
+    {
+      ErrorLogAdd(reasonStr);
+    }
+  }
 
   FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(13);
@@ -91,6 +157,9 @@ void setup()
   }
 
   CAN_SendEx(true, 1, IP_Send_to_CAN, 0x03);
+
+  SerialBridge.begin(115200);
+  Serial.println("SerialBridge initialisiert");
 
   esp_task_wdt_init(WDT_TIMEOUT_SEC, true);
   esp_task_wdt_add(NULL);
@@ -121,7 +190,89 @@ void loop()
   {
     if (rx_frame.extd) // Prüfe auf Extended Frame
     {
+      // Datum/Uhrzeit aus CAN-Paket 0x258 (Extended Frame)
+      UnixTime::syncFromCAN(rx_frame.identifier, rx_frame.data_length_code, rx_frame.data);
+
       CanInputOTA();
+
+      if (rx_frame.identifier == MessageBatteryStatusLeftID ||
+          rx_frame.identifier == MessageBatteryStatusRightID)
+      {
+        if (rx_frame.data_length_code >= 8)
+        {
+          bool batteryOn = (rx_frame.data[7] & BATTERY_STATUS_ON_BIT) != 0;
+          bool emergencyShutdown = (rx_frame.data[7] & BATTERY_STATUS_EMERGENCY_BIT) != 0;
+
+          bool batteryError = (rx_frame.data[7] & BATTERY_STATUS_ERROR_BIT) != 0;
+          if (rx_frame.identifier == MessageBatteryStatusLeftID)
+          {
+            batteryLeftKnown = true;
+            batteryLeftOn = batteryOn;
+            batteryLeftEmergency = emergencyShutdown;
+            batteryLeftError = batteryError;
+            batteryLeftLastSeen = millis();
+          }
+          else
+          {
+            batteryRightKnown = true;
+            batteryRightOn = batteryOn;
+            batteryRightEmergency = emergencyShutdown;
+            batteryRightError = batteryError;
+            batteryRightLastSeen = millis();
+          }
+
+          bool bothBatteriesEmergency = batteryLeftKnown && batteryRightKnown && batteryLeftEmergency && batteryRightEmergency;
+          bool otherBatteryOn = (rx_frame.identifier == MessageBatteryStatusLeftID) ? batteryRightOn : batteryLeftOn;
+          bool otherBatteryKnown = (rx_frame.identifier == MessageBatteryStatusLeftID) ? batteryRightKnown : batteryLeftKnown;
+          bool otherBatteryOff = otherBatteryKnown && !otherBatteryOn;
+          bool thisBatteryIsLastOn = batteryOn && otherBatteryOff;
+          bool thisBatteryError = (rx_frame.identifier == MessageBatteryStatusLeftID) ? batteryLeftError : batteryRightError;
+          bool otherBatteryError = (rx_frame.identifier == MessageBatteryStatusLeftID) ? batteryRightError : batteryLeftError;
+
+          if (!manualOffActive)
+          {
+            if (thisBatteryError && thisBatteryIsLastOn)
+            {
+              Serial.println("[BatteryStatus] letzte Batterie meldet Fehler, Regler wird ausgeschaltet.");
+              setChargerOnOff(false);
+            }
+            else if (bothBatteriesEmergency || (emergencyShutdown && thisBatteryIsLastOn))
+            {
+              Serial.println("[BatteryStatus] Notabschaltung für letzte Batterie, Regler wird ausgeschaltet.");
+              setChargerOnOff(false);
+            }
+          }
+          else if (batteryLeftKnown || batteryRightKnown)
+          {
+            static bool prevManualOffActive = false;
+            if (prevManualOffActive != manualOffActive)
+            {
+              if (manualOffActive)
+                Serial.println("[BatteryStatus] Manuelle Abschaltung aktiv, automatische Reglersteuerung unterdrückt.");
+              else
+                Serial.println("[BatteryStatus] Manuelle Abschaltung aufgehoben, automatische Reglersteuerung aktiv.");
+              prevManualOffActive = manualOffActive;
+            }
+          }
+
+          if (!batteryStartupCheckDone)
+          {
+            if (batteryLeftOn || batteryRightOn)
+            {
+              batteryStartupCheckDone = true;
+            }
+            else if (batteryLeftKnown && batteryRightKnown)
+            {
+              if (solarData.stateOfOperation != 0)
+              {
+                Serial.println("[BatteryStatus] Beim Start keine Batterie ein, Regler wird ausgeschaltet.");
+                setChargerOnOff(false);
+              }
+              batteryStartupCheckDone = true;
+            }
+          }
+        }
+      }
 
       // VE.Direct Ladespannungen lesen/setzen via CAN
       handleSolarCanCommand(rx_frame,
@@ -137,13 +288,40 @@ void loop()
         {
           OTA_Stop();
         }
-        if (rx_frame.data[0] == 0x01 && rx_frame.data[1] == 0x01)
+        else if (rx_frame.data[0] == 0x01 && rx_frame.data[1] == 0x01)
         {
           OTA_Start();
+        }
+        else if (rx_frame.data[0] == 0x01 && rx_frame.data[1] == 0x02)
+        {
+          Serial.println("SerialBridge deaktivieren");
+          SerialBridge.stopBridge();
+        }
+        else if (rx_frame.data[0] == 0x01 && rx_frame.data[1] == 0x03)
+        {
+          Serial.println("SerialBridge aktivieren");
+          SerialBridge.beginBridge();
         }
       }
     }
   }
+
+  unsigned long now = millis();
+  if (batteryLeftLastSeen > 0 && now - batteryLeftLastSeen > BATTERY_STATUS_TIMEOUT_MS)
+  {
+    batteryLeftOn = false;
+    batteryLeftEmergency = false;
+    batteryLeftLastSeen = now;
+  }
+  if (batteryRightLastSeen > 0 && now - batteryRightLastSeen > BATTERY_STATUS_TIMEOUT_MS)
+  {
+    batteryRightOn = false;
+    batteryRightEmergency = false;
+    batteryRightLastSeen = now;
+  }
+
+  // SerialBridge-Handling
+  SerialBridge.handleBridge();
 
   // Serielles Debug-Menü
   handleSerialDebug();
@@ -175,6 +353,38 @@ void loop()
   if (dataUpdated)
     lastSolarDataTime = millis();
 
+  static unsigned long lastYieldQueryMs = 0;
+  static unsigned long lastYieldSendMs = 0;
+  static bool yieldValuesReady = false;
+  if (!yieldValuesReady && (lastYieldQueryMs == 0 || millis() - lastYieldQueryMs > 60000))
+  {
+    suppressTextMode();
+    if (getYield(0)) {
+      yieldValuesReady = true;
+      lastYieldSendMs = millis() - 6000; // erstes Senden sofort erlauben
+    }
+    lastYieldQueryMs = millis();
+  }
+
+  if (yieldValuesReady && millis() - lastYieldSendMs > 6000)
+  {
+    uint16_t yieldTodayRaw = (uint16_t)roundf(solarData.yieldToday * 10.0f);
+    uint16_t maxPowerRaw = (uint16_t)roundf(solarData.maxPowerToday * 10.0f);
+    uint16_t solarMaxRaw = (uint16_t)roundf(solarData.panelVoltageMax * 10.0f);
+    uint16_t batMaxRaw = (uint16_t)roundf(solarData.batteryVoltageMax * 10.0f);
+    CAN_SendEx(true, 8, MessageYieldSummaryID,
+               (yieldTodayRaw >> 8) & 0xFF, yieldTodayRaw & 0xFF,
+               (maxPowerRaw >> 8) & 0xFF, maxPowerRaw & 0xFF,
+               (solarMaxRaw >> 8) & 0xFF, solarMaxRaw & 0xFF,
+               (batMaxRaw >> 8) & 0xFF, batMaxRaw & 0xFF);
+
+    uint16_t batMinRaw = (uint16_t)roundf(solarData.batteryVoltageMin * 10.0f);
+    CAN_SendEx(true, 2, MessageBatteryMinID,
+               (batMinRaw >> 8) & 0xFF, batMinRaw & 0xFF);
+
+    lastYieldSendMs = millis();
+  }
+
   bool sensorUpdated = Sensors_Update();
 
   if (sensorUpdated)
@@ -193,32 +403,40 @@ void loop()
   }
 
   // Falls gerade kein neuer Solar-Frame kam, bei Sensor-Update dennoch anzeigen.
-  if (liveMode && !dataUpdated && sensorUpdated)
+  else if (liveMode && !dataUpdated && sensorUpdated)
   {
     Sensors_Print();
   }
 
-  // CAN: Batteriespannung (mV), Ladestrom (A*10) und Leistung (W) senden bei neuen Reglerdaten
+  // CAN: Batteriespannung (mV), Ladestrom (A*10), Leistung (W) und Betriebszustand (CS) senden bei neuen Reglerdaten
   if (dataUpdated)
   {
     int16_t batV = (int16_t)(solarData.batteryVoltage * 1000.0f); // mV
     int16_t ladeA = (int16_t)(solarData.batteryCurrent * 10.0f);  // A → 0,1A Schritte
     int16_t ladeW = (int16_t)solarData.panelPower;                // W
-    CAN_SendEx(true, 6, MessageBasisID,
+    uint8_t cs = (uint8_t)solarData.stateOfOperation;             // CS Betriebszustand
+    CAN_SendEx(true, 7, MessageBasisID,
                (batV >> 8) & 0xFF, batV & 0xFF,
                (ladeA >> 8) & 0xFF, ladeA & 0xFF,
-               (ladeW >> 8) & 0xFF, ladeW & 0xFF);
+               (ladeW >> 8) & 0xFF, ladeW & 0xFF,
+               cs);
 
-    // Solar-Panel: Spannung (mV), berechneter Strom (PPV/VPV, 0.1A), Tageszähler (HSDS)
-    int16_t solV = (int16_t)(solarData.panelVoltage * 1000.0f); // V → mV
+    // Solar-Panel: Spannung (V*100, big-endian), berechneter Strom (PPV/VPV, 0.1A), Tageszähler (HSDS), Abschaltgrund (OR)
+    uint16_t solV = (uint16_t)roundf(solarData.panelVoltage * 100.0f); // V → 0.01V
     int16_t solA = (solarData.panelVoltage > 0.1f)
-                       ? (int16_t)(solarData.panelPower * 10.0f / solarData.panelVoltage)
+                       ? (int16_t)roundf(solarData.panelPower * 10.0f / solarData.panelVoltage)
                        : 0;                        // 0.1A Schritte
     int16_t hsds = (int16_t)solarData.daySequence; // Tageszähler (HSDS)
-    CAN_SendEx(true, 6, MessageBasisID1,
+    uint8_t ds18TempByte = 0xFF;
+    uint8_t dhtTempByte = 0xFF;
+    uint8_t dhtHumidityByte = 0xFF;
+    Sensors_GetCanBytes(ds18TempByte, dhtTempByte, dhtHumidityByte);
+    CAN_SendEx(true, 8, MessageBasisID1,
                (solV >> 8) & 0xFF, solV & 0xFF,
                (solA >> 8) & 0xFF, solA & 0xFF,
-               (hsds >> 8) & 0xFF, hsds & 0xFF);
+               (hsds >> 8) & 0xFF, hsds & 0xFF,
+               (uint8_t)solarData.offReason,
+               ds18TempByte);
   }
 
   // Heartbeat alle 30s

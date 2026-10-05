@@ -5,15 +5,35 @@
 // =============================================================================
 // CAN-Pakete Solar (gesendet bei jedem vollständigen VE.Direct TEXT-Frame):
 //
-// MessageBasisID  (solar_links: 0x4E2 | solar_rechts: 0x500)  DLC=6
+// MessageBasisID  (solar_links: 0x4E2 | solar_rechts: 0x500)  DLC=7
 //   Byte 0-1 : Batteriespannung    [mV]      int16  (z.B. 12800 = 12,8V)
 //   Byte 2-3 : Ladestrom           [0,1A]    int16  (z.B.  15  =  1,5A)
 //   Byte 4-5 : Panel-Leistung      [W]       int16  (z.B. 120  = 120W)
+//   Byte 6   : Betriebszustand     [CS]      uint8  (VE.Direct CS)
 //
-// MessageBasisID1 (solar_links: 0x4E3 | solar_rechts: 0x501)  DLC=6
-//   Byte 0-1 : Panel-Spannung      [mV]      int16  (z.B. 17500 = 17,5V)
-//   Byte 2-3 : Panel-Strom (PPV/VPV) [0,1A]  int16  (berechnet, da kein direktes IL-Feld)
-//   Byte 4-5 : Tageszähler HSDS    [-]       int16  (Tage seit Inbetriebnahme)
+// MessageBasisID1 (solar_links: 0x4E3 | solar_rechts: 0x501)  DLC=8
+//   Byte 0-1 : Panel-Spannung      [V*100]   uint16 BE  (z.B. 3550 = 35,50V)
+//   Byte 2-3 : Panel-Strom (PPV/VPV) [0,1A]  int16      (berechnet, da kein direktes IL-Feld)
+//   Byte 4-5 : Tageszähler HSDS    [-]       int16      (Tage seit Inbetriebnahme)
+//   Byte 6   : Abschaltgrund       [OR]       uint8      (Regler-Abschaltgrund)
+//   Byte 7   : DS18B20-Temperatur  [(T[degC] + 50)] uint8, 0xFF = ungültig
+//
+// MessageYieldSummaryID (solar_links: 0x4E7 | solar_rechts: 0x505) DLC=8
+//   Byte 0-1 : Ertrag heute        [0,1 kWh] uint16 BE
+//   Byte 2-3 : Max-Leistung heute   [0,1 W]   uint16 BE
+//   Byte 4-5 : Solar max.          [0,1 V]   uint16 BE
+//   Byte 6-7 : Akku max.           [0,1 V]   uint16 BE
+//
+// MessageBatteryMinID (solar_links: 0x4E8 | solar_rechts: 0x506) DLC=2
+//   Byte 0-1 : Akku min.           [0,1 V]   uint16 BE
+//
+// MessageBatteryStatusID (solar_links: 0x320, solar_rechts: 0x334) DLC=8
+//   Byte 0-6 : reserviert / optional
+//   Byte 7   : Statusbyte
+//     Bit4 (0-basiert) = 1 wenn Batterie ein, 0 wenn Batterie aus
+//     Bit6 (0-basiert) = 1 wenn Batterie-Fehler (letzte Batterie darf nicht eingeschaltet werden)
+//     Bit7 (0-basiert) = 1 wenn Notabschaltung in 5 Sekunden
+//       Regler werden nur ausgeschaltet, wenn sie die letzte aktive Batterie ist
 //
 // MessageSensorID (solar_links: 0x4E6 | solar_rechts: 0x504) DLC=3
 //   Byte 0 : DS18B20 Temp          [(T[degC] + 50)]       uint8, 0xFF = ungültig
@@ -48,6 +68,10 @@ constexpr uint16_t MessageBasisID1 = 0x4E3; // 1251 dezimal
 constexpr uint16_t Can_Solar_Cmd = 0x4E4;   // 1252 dezimal
 constexpr uint16_t Can_Solar_Resp = 0x4E5;  // 1253 dezimal
 constexpr uint16_t MessageSensorID = 0x4E6; // 1254 dezimal
+constexpr uint16_t MessageYieldSummaryID = 0x4E7; // 1255 dezimal
+constexpr uint16_t MessageBatteryMinID = 0x4E8;  // 1256 dezimal
+constexpr uint16_t MessageBatteryStatusLeftID = 0x320; // Batterie-Status Batterie links
+constexpr uint16_t MessageBatteryStatusRightID = 0x334; // Batterie-Status Batterie rechts
 constexpr uint16_t OTA_On_Off = 0x4EB;      // 1259 dezimal
 constexpr uint16_t IP_Send_to_CAN = 0x4EC;  // 1260 dezimal
 
@@ -61,6 +85,10 @@ constexpr uint16_t MessageBasisID1 = 0x501; // 1281 dezimal
 constexpr uint16_t Can_Solar_Cmd = 0x502;   // 1282 dezimal
 constexpr uint16_t Can_Solar_Resp = 0x503;  // 1283 dezimal
 constexpr uint16_t MessageSensorID = 0x504; // 1284 dezimal
+constexpr uint16_t MessageYieldSummaryID = 0x505; // 1285 dezimal
+constexpr uint16_t MessageBatteryMinID = 0x506;  // 1286 dezimal
+constexpr uint16_t MessageBatteryStatusLeftID = 0x320; // Batterie-Status Batterie links
+constexpr uint16_t MessageBatteryStatusRightID = 0x334; // Batterie-Status Batterie rechts
 constexpr uint16_t OTA_On_Off = 0x509;      // 1289 dezimal
 constexpr uint16_t IP_Send_to_CAN = 0x50A;  // 1290 dezimal
 

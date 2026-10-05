@@ -21,6 +21,9 @@ struct SolarData
   float maxPowerToday = 0.0;     // H21 (W)
   float yieldYesterday = 0.0;    // H22 (kWh * 100)
   float maxPowerYesterday = 0.0; // H23 (W)
+  float panelVoltageMax = 0.0;   // Max. Solarspannung heute (V)
+  float batteryVoltageMax = 0.0; // Max. Akkuspannung heute (V)
+  float batteryVoltageMin = 0.0; // Min. Akkuspannung heute (V)
   int daySequence = 0;           // HSDS
 };
 
@@ -88,6 +91,35 @@ String getOffReasonText(int reason)
     return "Fernsteuerung aus";
   default:
     return "Unbekannt (" + String(reason) + ")";
+  }
+}
+
+String getCSStateText(int cs)
+{
+  switch (cs)
+  {
+  case 0:
+    return "Aus";
+  case 1:
+    return "Niedrige Leistung";
+  case 2:
+    return "Fehler";
+  case 3:
+    return "Bulk";
+  case 4:
+    return "Absorption";
+  case 5:
+    return "Float";
+  case 6:
+    return "Equalize";
+  case 7:
+    return "Start";
+  case 8:
+    return "Pwr-Tracking";
+  case 9:
+    return "Prüfung";
+  default:
+    return "Unbekannt (" + String(cs) + ")";
   }
 }
 
@@ -196,10 +228,8 @@ inline bool parseSolarData()
 
 void SolarDatenAusgabe()
 {
-  if (dataUpdated)
-  {
-    Serial.write(0x00); // Null-Byte zum Löschen in Hterm
-    Serial.println("--- Smart Solar Daten (alle empfangen) ---");
+  Serial.write(0x00); // Null-Byte zum Löschen in Hterm
+  Serial.println("--- Smart Solar Daten ---");
     Serial.print("Battery-Spannung: ");
     Serial.print(solarData.batteryVoltage);
     Serial.println(" V");
@@ -213,7 +243,10 @@ void SolarDatenAusgabe()
     Serial.print(solarData.panelPower);
     Serial.println(" W");
     Serial.print("Betriebszustand: ");
-    Serial.println(solarData.stateOfOperation);
+    Serial.print(solarData.stateOfOperation);
+    Serial.print(" (");
+    Serial.print(getCSStateText(solarData.stateOfOperation));
+    Serial.println(")");
     Serial.print("Tracker-Modus: ");
     Serial.println(solarData.trackerMode);
     Serial.print("Ausschalt-Grund: ");
@@ -238,7 +271,6 @@ void SolarDatenAusgabe()
     Serial.print("Tagessequenz: ");
     Serial.println(solarData.daySequence);
     dataUpdated = false;
-  }
 }
 
 #endif // SOLAR_DATA_RECEIVER_H

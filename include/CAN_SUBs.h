@@ -50,6 +50,8 @@ static uint8_t canRecoveryFailCount = 0;
 static bool s_canTxErrorReported = false;      // TX-Fehler nur einmal pro Fehlerphase melden
 static bool s_canBusAlertReported = false;     // Bus-Alert nur einmal pro Fehlerphase melden
 static bool s_wasBusOff = false;              // Zustand für Bus-Recovery-Meldung
+static uint8_t s_canAlertErrorStreak = 0;     // Aufeinanderfolgende Fehlerereignisse
+static uint8_t s_canAlertOkStreak = 0;        // Fehlerfreie Zyklen seit letztem Fehler
 
 
 // Mindestabstand zwischen CAN-Paketen damit andere Teilnehmer senden können
@@ -108,10 +110,15 @@ void CAN_CheckAndRecoverBusOff()
 
   if (twai_read_alerts(&alerts, 0) == ESP_OK && alerts != 0)
   {
+    bool hasError = false;
+
     if (alerts & TWAI_ALERT_BUS_OFF)
     {
       busOffDetected = true;
-      if (!s_canBusAlertReported)
+      hasError = true;
+      if (s_canAlertErrorStreak < 5) s_canAlertErrorStreak++;
+      s_canAlertOkStreak = 0;
+      if (s_canAlertErrorStreak >= 5 && !s_canBusAlertReported)
       {
         ErrorLogAdd("[CAN] Bus-Off erkannt (Alert)");
         Serial.println("[CAN] Bus-Off erkannt (Alert)");
@@ -120,7 +127,10 @@ void CAN_CheckAndRecoverBusOff()
     }
     if (alerts & TWAI_ALERT_ERR_PASS)
     {
-      if (!s_canBusAlertReported)
+      hasError = true;
+      if (s_canAlertErrorStreak < 5) s_canAlertErrorStreak++;
+      s_canAlertOkStreak = 0;
+      if (s_canAlertErrorStreak >= 5 && !s_canBusAlertReported)
       {
         ErrorLogAdd("[CAN] Error-Passive – kein CAN-Bus angeschlossen?");
         Serial.println("[CAN] Error-Passive – kein CAN-Bus angeschlossen?");
@@ -129,7 +139,10 @@ void CAN_CheckAndRecoverBusOff()
     }
     if (alerts & TWAI_ALERT_ABOVE_ERR_WARN)
     {
-      if (!s_canBusAlertReported)
+      hasError = true;
+      if (s_canAlertErrorStreak < 5) s_canAlertErrorStreak++;
+      s_canAlertOkStreak = 0;
+      if (s_canAlertErrorStreak >= 5 && !s_canBusAlertReported)
       {
         ErrorLogAdd("[CAN] Error-Warnung");
         Serial.println("[CAN] Error-Warnung");
@@ -140,10 +153,37 @@ void CAN_CheckAndRecoverBusOff()
     {
       _canTxErrCount = 0;
       s_canBusAlertReported = false;
+      s_canAlertErrorStreak = 0;
+      s_canAlertOkStreak = 0;
       ErrorLogResetSuppression();
       busRecovered = false; // Alert hat bereits geloggt – Zustandsmaschine überspringen
       Serial.println("[CAN] Bus wiederhergestellt");
       ErrorLogAdd("[CAN] Bus wiederhergestellt");
+    }
+    if (!hasError)
+    {
+      if (s_canAlertErrorStreak > 0)
+      {
+        if (++s_canAlertOkStreak >= 3)
+        {
+          s_canAlertErrorStreak = 0;
+          s_canAlertOkStreak = 0;
+          s_canBusAlertReported = false;
+        }
+      }
+    }
+  }
+  else
+  {
+    // Kein Alert in diesem Zyklus – OK-Streak zählen
+    if (s_canAlertErrorStreak > 0)
+    {
+      if (++s_canAlertOkStreak >= 3)
+      {
+        s_canAlertErrorStreak = 0;
+        s_canAlertOkStreak = 0;
+        s_canBusAlertReported = false;
+      }
     }
   }
 

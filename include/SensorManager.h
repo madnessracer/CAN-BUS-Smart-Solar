@@ -76,6 +76,12 @@ namespace SensorManagerInternal
     return value;
   }
 
+  inline uint8_t &dhtErrorStreak()
+  {
+    static uint8_t value = 0;
+    return value;
+  }
+
   inline uint8_t &dsValidStreak()
   {
     static uint8_t value = 0;
@@ -143,16 +149,23 @@ namespace SensorManagerInternal
 
     if (dhtOk)
     {
+      dhtErrorStreak() = 0;
       if (++dhtValidStreak() >= 3)
         bootDiagPrintedDhtInvalid() = false;
     }
     else
     {
       dhtValidStreak() = 0;
-      if (!bootDiagPrintedDhtInvalid())
+      if (dhtErrorStreak() < 5)
+        dhtErrorStreak()++;
+      if (dhtErrorStreak() == 3)
+      {
+        dht().begin(); // Stiller Neuversuch nach 3 Fehlern
+        Serial.println("[Sensor] DHT22: Neuinitialisierung (3 Fehler)");
+      }
+      if (dhtErrorStreak() >= 5 && !bootDiagPrintedDhtInvalid())
       {
         Serial.println("[Sensor] DHT22 ungueltig/nicht vorhanden");
-        ErrorLogAdd("[Sensor] DHT22 ungueltig/nicht vorhanden");
         bootDiagPrintedDhtInvalid() = true;
       }
     }

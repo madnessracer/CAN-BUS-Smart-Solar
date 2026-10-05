@@ -2,6 +2,7 @@
 #define __Wlan_Config_H__
 
 #include <esp_task_wdt.h>
+#include <UnixTime.h>
 
 const char *ssid;
 const char *password;
@@ -73,6 +74,7 @@ void OTA_Start()
 
   ArduinoOTA.begin();
   WiFi.setSleep(false); // Modem-Sleep deaktivieren – verhindert OTA-Stocken
+  UnixTime::begin();    // NTP-Sync starten (läuft unabhängig im Hintergrund)
 
   // Callbacks NACH begin() setzen
     ArduinoOTA.onStart([]() {
@@ -96,6 +98,7 @@ void OTA_Start()
   ArduinoOTA.onEnd([]() {
     Serial.println("OTA Ende: Watchdog zurück auf 10s");
     incrementFirmwareVersion();
+    OTA_SetPendingReset();
     CAN_SendEx(true, 1, IP_Send_to_CAN, 0x06);
     WiFi.setSleep(true);
     esp_task_wdt_delete(NULL);

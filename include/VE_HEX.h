@@ -201,6 +201,15 @@ bool getYield(int tag) {
 
   Serial.printf("%s: %.2f kWh, Max. %lu W, Solar max. %.2f V, Akku max. %.2f V, Akku min. %.2f V\n",
     tagName.c_str(), yieldKwh, (unsigned long)powerRaw, vPanelMax * 0.01f, vBatMax * 0.01f, vBatMin * 0.01f);
+
+  if (tag == 0) {
+    solarData.yieldToday = yieldKwh;
+    solarData.maxPowerToday = (float)powerRaw;
+    solarData.panelVoltageMax = vPanelMax * 0.01f;
+    solarData.batteryVoltageMax = vBatMax * 0.01f;
+    solarData.batteryVoltageMin = vBatMin * 0.01f;
+  }
+
   return true;
 }
 

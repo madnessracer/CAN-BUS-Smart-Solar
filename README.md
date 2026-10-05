@@ -56,8 +56,10 @@ Alle Pakete werden bei jedem vollständigen VE.Direct TEXT-Frame gesendet (~1×/
 
 | CAN-ID | solar_links | solar_rechts | DLC | Inhalt |
 |---|---|---|---|---|
-| `MessageBasisID` | 0x4E2 | 0x500 | 6 | Byte 0-1: Batteriespannung [mV] · Byte 2-3: Ladestrom [0,1A] · Byte 4-5: Panel-Leistung [W] |
-| `MessageBasisID1` | 0x4E3 | 0x501 | 6 | Byte 0-1: Panel-Spannung [mV] · Byte 2-3: Panel-Strom (PPV/VPV, berechnet) [0,1A] · Byte 4-5: Tageszähler HSDS |
+| `MessageBasisID` | 0x4E2 | 0x500 | 7 | Byte 0-1: Batteriespannung [mV] · Byte 2-3: Ladestrom [0,1A] · Byte 4-5: Panel-Leistung [W] · Byte 6: Betriebszustand [CS] |
+| `MessageBasisID1` | 0x4E3 | 0x501 | 6 | Byte 0-1: Panel-Spannung [V*100] · Byte 2-3: Panel-Strom (PPV/VPV, berechnet) [0,1A] · Byte 4-5: Tageszähler HSDS |
+| `MessageYieldSummaryID` | 0x4E7 | 0x505 | 8 | Byte 0-1: Ertrag heute [0,1 kWh] · Byte 2-3: Max-Leistung heute [0,1 W] · Byte 4-5: Solar max [0,1 V] · Byte 6-7: Akku max [0,1 V] |
+| `MessageBatteryMinID` | 0x4E8 | 0x506 | 2 | Byte 0-1: Akku min [0,1 V] |
 | `MessageSensorID` | 0x4E6 | 0x504 | 3 | Byte 0: DS18B20 Temp (T+50) · Byte 1: DHT22 Temp (T+50) · Byte 2: DHT22 Feuchte [%] |
 
 Sensor-Byte-Codierung:

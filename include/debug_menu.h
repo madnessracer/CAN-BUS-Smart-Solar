@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <cstring>
 #include <esp_task_wdt.h>
+#include <esp_system.h>
 #include "VE_HEX.h"
 #include "solar_data_receiver.h"
 #include "FileSystem.h"
@@ -17,6 +18,16 @@ static constexpr uint32_t CANPING_RESPONSE_ID = 0x1FFFFF04UL;
 
 extern bool debugMode;
 extern bool liveMode;
+extern bool batteryLeftKnown;
+extern bool batteryRightKnown;
+extern bool batteryLeftOn;
+extern bool batteryRightOn;
+extern bool batteryLeftError;
+extern bool batteryRightError;
+extern bool batteryLeftEmergency;
+extern bool batteryRightEmergency;
+extern unsigned long batteryLeftLastSeen;
+extern unsigned long batteryRightLastSeen;
 
 // WiFi-Untermenü Status
 static bool wifiMode = false;
@@ -323,17 +334,15 @@ void handleDebugMenu(String input) {
     Serial.println("ertrag ?              - Anzahl Ertragstage, Gesamt & seit Reset");
     Serial.println("ertrag gesamt/reset   - Gesamtertrag oder Ertrag seit Reset einzeln");
     Serial.println("wifi                  - WiFi-Untermenü (SSID/Passwort anzeigen & ändern)");
-    Serial.println("ota ein/aus/status    - OTA-Update starten, beenden oder Status anzeigen");
+    Serial.println("ota on/off/status     - OTA-Update starten, beenden oder Status anzeigen");
     Serial.println("ota timeout <min>     - OTA Auto-Aus Zeit setzen (0 = deaktiviert)");
-    Serial.println("selftest              - Systemtest (CAN, VE.Direct, Werte, OTA/WiFi)");
+    Serial.println("status                - Systemstatus (Zeit, Uptime, WiFi, CAN, Sensoren)");
     Serial.println("cantest [n]           - CAN-Leitungstest mit n Frames (Standard 3, max 10000)");
     Serial.println("canping [n] [to]      - Fast-Ping Qualitaetstest (Req/Resp), n=Pakete (max 10000), to=Timeout ms (1..2000, default 20)");
     Serial.println("canpingtx [n]         - Reiner CAN-Sendetest mit fester ID (Fast-Mode, ohne RTT), Standard n=100");
-    Serial.println("log             - Letzte 20 Fehler anzeigen");
-    Serial.println("log test        - Testeintrag ins Fehlerlog schreiben");
-    Serial.println("log info        - Fehlerlog-Status (Fenster, Limits)");
-    Serial.println("log window <s>  - Dedupe-Fenster setzen (1..600s)");
-    Serial.println("log clear       - Fehlerlog löschen");
+    Serial.println("log /test] /clear     - Fehler anzeigen, Testeintrag, löschen");
+    Serial.println("log info /window <s>  - Status anzeigen, Dedupe-Fenster setzen (1..600s)");
+    Serial.println("time [gps]            - Uhrzeit & Uptime live anzeigen; 'gps' zeigt CAN-Zeitquelle (0x258) (beliebige Taste beendet)");
     Serial.println("live                  - Solardaten live anzeigen (beliebige Taste beendet)");
     Serial.println("dht live              - DHT22 live anzeigen, jede Sekunde (beliebige Taste beendet)");
     Serial.println("sensor                - Letzte DHT22/DS18B20 Messwerte anzeigen");
@@ -449,18 +458,18 @@ void handleDebugMenu(String input) {
     wifiMode = true;
     wifiStep = WIFI_MENU;
     handleWifiMenu("wifi help");
-  } else if (input == "ota ein") {
+  } else if (input == "ota on") {
     Serial.println("Starte OTA...");
     OTA_Start();
     Serial.println(OTA_On == 1 ? "OTA aktiv." : "OTA-Start fehlgeschlagen.");
-  } else if (input == "ota aus") {
+  } else if (input == "ota off") {
     OTA_Stop();
     Serial.println("OTA beendet.");
   } else if (input == "ota status") {
     Serial.printf("OTA: %s", OTA_On == 1 ? "aktiv" : "inaktiv");
     if (OTA_On == 1 && otaTimeoutMs > 0) {
-      unsigned long remaining = (otaStartTime + otaTimeoutMs > millis())
-        ? (otaStartTime + otaTimeoutMs - millis()) / 1000UL : 0;
+      unsigned long elapsed = millis() - otaStartTime;
+      unsigned long remaining = (elapsed < otaTimeoutMs) ? (otaTimeoutMs - elapsed) / 1000UL : 0;
       Serial.printf(" | Auto-Aus in %lu s", remaining);
     }
     Serial.println();
@@ -480,6 +489,99 @@ void handleDebugMenu(String input) {
       Serial.println("OTA-Timeout deaktiviert.");
     else
       Serial.printf("OTA-Timeout gesetzt auf %lu min.\n", min);
+  } else if (input == "status") {
+    Serial.write(0x00);
+    Serial.println("===== Systemstatus =====");
+    // Zeit & Uptime
+    Serial.printf("Uhrzeit  : %s\n", UnixTime::isSynced() ? UnixTime::nowString().c_str() : "nicht synchronisiert");
+    {
+      unsigned long upSec = millis() / 1000UL;
+      unsigned long upD = upSec / 86400UL; upSec %= 86400UL;
+      unsigned long upH = upSec / 3600UL;  upSec %= 3600UL;
+      unsigned long upM = upSec / 60UL;    upSec %= 60UL;
+      Serial.printf("Uptime   : %lud %02lu:%02lu:%02lu\n", upD, upH, upM, upSec);
+    }
+    // Firmware & Boot
+    Serial.printf("Firmware : v%lu  |  Boots: %lu\n", getFirmwareVersion(), getBootCount());
+    // Reset-Grund
+    {
+      esp_reset_reason_t r = esp_reset_reason();
+      const char *rs = "Unbekannt";
+      switch(r) {
+        case ESP_RST_POWERON:  rs = "Power-On"; break;
+        case ESP_RST_SW:       rs = "Software"; break;
+        case ESP_RST_PANIC:    rs = "Crash/Panic"; break;
+        case ESP_RST_INT_WDT:  rs = "Int-Watchdog"; break;
+        case ESP_RST_TASK_WDT: rs = "Task-Watchdog"; break;
+        case ESP_RST_WDT:      rs = "Watchdog"; break;
+        case ESP_RST_BROWNOUT: rs = "Brownout"; break;
+        default: break;
+      }
+      Serial.printf("Letzter Reset: %s\n", rs);
+    }
+    // WiFi
+    Serial.printf("WiFi     : %s", OTA_On == 1 ? "aktiv (OTA)" : (WiFi.status() == WL_CONNECTED ? "verbunden" : "getrennt"));
+    if (WiFi.status() == WL_CONNECTED) Serial.printf(" | IP: %s | RSSI: %d dBm", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    Serial.println();
+    // CAN
+    {
+      twai_status_info_t cs = {};
+      twai_get_status_info(&cs);
+      const char *stateStr = "Unbekannt";
+      switch(cs.state) {
+        case TWAI_STATE_STOPPED:   stateStr = "Gestoppt"; break;
+        case TWAI_STATE_RUNNING:   stateStr = "OK"; break;
+        case TWAI_STATE_BUS_OFF:   stateStr = "BUS-OFF"; break;
+        case TWAI_STATE_RECOVERING:stateStr = "Recovery"; break;
+        default: break;
+      }
+      Serial.printf("CAN      : %s | TX-Err: %u | RX-Err: %u\n", stateStr, cs.tx_error_counter, cs.rx_error_counter);
+    }
+    // CAN-Zeit
+    if (UnixTime::hasCanTime()) {
+      unsigned long ageMs = millis() - UnixTime::lastCanMs();
+      Serial.printf("CAN-Zeit : OK | letztes Paket vor %lu ms\n", ageMs);
+    } else {
+      Serial.println("CAN-Zeit : kein 0x258 Paket empfangen");
+    }
+    // Batterie-Status
+    {
+      unsigned long now = millis();
+      Serial.println("Batterie :");
+      if (batteryLeftKnown) {
+        Serial.printf("  Links : %s | Fehler=%s | Not-Aus=%s | letzte Meldung vor %lums\n",
+          batteryLeftOn ? "ON" : "OFF",
+          batteryLeftError ? "JA" : "NEIN",
+          batteryLeftEmergency ? "JA" : "NEIN",
+          now - batteryLeftLastSeen);
+      } else {
+        Serial.println("  Links : unbekannt");
+      }
+      if (batteryRightKnown) {
+        Serial.printf("  Rechts: %s | Fehler=%s | Not-Aus=%s | letzte Meldung vor %lums\n",
+          batteryRightOn ? "ON" : "OFF",
+          batteryRightError ? "JA" : "NEIN",
+          batteryRightEmergency ? "JA" : "NEIN",
+          now - batteryRightLastSeen);
+      } else {
+        Serial.println("  Rechts: unbekannt");
+      }
+    }
+    // Sensoren
+    {
+      const AmbientSensorData &s = Sensors_GetData();
+      if (s.dhtValid)
+        Serial.printf("DHT22    : Temp=%.1f C  Feuchte=%.1f %%\n", s.dhtTempC, s.dhtHumidity);
+      else
+        Serial.println("DHT22    : ungueltig");
+      if (s.ds18Valid)
+        Serial.printf("DS18B20  : Temp=%.1f C\n", s.ds18TempC);
+      else
+        Serial.println("DS18B20  : ungueltig");
+    }
+    // Fehlerlog
+    Serial.printf("Fehlerlog: %u Eintraege\n", g_errorLogRamCount);
+    Serial.println("=======================");
   } else if (input == "selftest") {
     runSystemSelfTest();
   } else if (input == "cantest") {
@@ -569,8 +671,87 @@ void handleDebugMenu(String input) {
       } else {
         Serial.println("DHT22: ungueltig");
       }
-      unsigned long wait = millis() + 1000;
-      while (millis() < wait) {
+      unsigned long waitStart = millis();
+      while (millis() - waitStart < 1000UL) {
+        esp_task_wdt_reset();
+        if (Serial.available()) break;
+        delay(10);
+      }
+    }
+  } else if (input == "time gps") {
+    Serial.println("CAN-Zeit Live-Modus (0x258). Beliebige Taste zum Beenden.");
+    static uint32_t dbgLastId = 0;
+    static uint8_t  dbgLastDlc = 0;
+    while (true) {
+      esp_task_wdt_reset();
+      // CAN-Frames im Hintergrund mitlesen um letzte ID/DLC zu merken
+      twai_message_t dbgFrame;
+      while (twai_receive(&dbgFrame, 0) == ESP_OK) {
+        dbgLastId  = dbgFrame.identifier;
+        dbgLastDlc = dbgFrame.data_length_code;
+        UnixTime::syncFromCAN(dbgFrame.identifier, dbgFrame.data_length_code, dbgFrame.data);
+      }
+      if (Serial.available()) {
+        Serial.read();
+        Serial.write(0x00);
+        Serial.println("CAN-Zeit Live-Modus beendet.");
+        handleDebugMenu("help");
+        break;
+      }
+      Serial.write(0x00); // Terminal löschen
+      Serial.println("=== CAN-Zeit Live-Modus (0x258) === (beliebige Taste beendet)");
+      if (UnixTime::hasCanTime()) {
+        time_t canT   = UnixTime::lastCanTime();
+        unsigned long ageMs = millis() - UnixTime::lastCanMs();
+        time_t displayed = canT + (time_t)(ageMs / 1000UL);
+        struct tm ti;
+        localtime_r(&displayed, &ti);
+        char buf[20];
+        snprintf(buf, sizeof(buf), "%02d.%02d.%04d %02d:%02d:%02d",
+                 ti.tm_mday, ti.tm_mon + 1, ti.tm_year + 1900,
+                 ti.tm_hour, ti.tm_min, ti.tm_sec);
+        Serial.printf("CAN-Zeit  : %s\n", buf);
+        Serial.printf("Alter     : %lu ms seit letztem Paket\n", ageMs);
+        Serial.printf("Unix (CAN): %lu\n", (unsigned long)canT);
+      } else {
+        Serial.println("CAN-Zeit  : noch kein Paket 0x258 empfangen");
+      }
+      unsigned long waitStart = millis();
+      while (millis() - waitStart < 1000UL) {
+        esp_task_wdt_reset();
+        if (Serial.available()) break;
+        delay(10);
+      }
+    }
+  } else if (input == "time") {
+    Serial.println("Uhrzeit Live-Modus. Beliebige Taste zum Beenden.");
+    while (true) {
+      esp_task_wdt_reset();
+      if (Serial.available()) {
+        Serial.read();
+        Serial.write(0x00);
+        Serial.println("Uhrzeit Live-Modus beendet.");
+        handleDebugMenu("help");
+        break;
+      }
+      // Uptime berechnen
+      unsigned long upSec = millis() / 1000UL;
+      unsigned long upD   = upSec / 86400UL; upSec %= 86400UL;
+      unsigned long upH   = upSec / 3600UL;  upSec %= 3600UL;
+      unsigned long upM   = upSec / 60UL;    upSec %= 60UL;
+
+      Serial.write(0x00); // Terminal löschen
+      Serial.println("=== Zeit Live-Modus === (beliebige Taste beendet)");
+      if (UnixTime::isSynced()) {
+        Serial.printf("Uhrzeit : %s\n", UnixTime::nowString().c_str());
+        Serial.printf("Unix    : %lu\n", (unsigned long)UnixTime::now());
+      } else {
+        Serial.println("Uhrzeit : nicht synchronisiert (kein NTP/CAN)");
+      }
+      Serial.printf("Uptime  : %lud %02lu:%02lu:%02lu\n", upD, upH, upM, upSec);
+
+      unsigned long waitStart = millis();
+      while (millis() - waitStart < 1000UL) {
         esp_task_wdt_reset();
         if (Serial.available()) break;
         delay(10);
@@ -616,8 +797,9 @@ void handleSerialDebug() {
   }
 
   if (Serial.available()) {
+    Serial.setTimeout(20); // kurzer Timeout damit \r\n-Varianten sofort verarbeitet werden
     String input = Serial.readStringUntil('\n');
-    input.trim();
+    input.trim(); // entfernt \r, Leerzeichen etc.
     debugMenuLastActivity = millis(); // Aktivität zurücksetzen
     if (liveMode) {
       liveMode = false;
