@@ -666,11 +666,12 @@ void handleDebugMenu(String input) {
       }
       Sensors_ForceUpdate();
       const AmbientSensorData &s = Sensors_GetData();
-      if (s.dhtValid) {
-        Serial.printf("DHT22: Temp=%.1f C  Feuchte=%.1f %%\n", s.dhtTempC, s.dhtHumidity);
-      } else {
-        Serial.println("DHT22: ungueltig");
-      }
+      bool tempOk = !isnan(s.dhtTempC) && s.dhtTempC >= -40.0f && s.dhtTempC <= 85.0f;
+      bool humidityOk = !isnan(s.dhtHumidity) && s.dhtHumidity >= 0.0f && s.dhtHumidity <= 100.0f;
+      Serial.printf("DHT22: Temp=%.1f C [%s]  Feuchte=%.1f %% [%s]  Gesamt=[%s]\n",
+                    s.dhtTempC, tempOk ? "OK" : "FEHLER",
+                    s.dhtHumidity, humidityOk ? "OK" : "FEHLER",
+                    s.dhtValid ? "OK" : "FEHLER");
       unsigned long waitStart = millis();
       while (millis() - waitStart < 1000UL) {
         esp_task_wdt_reset();
